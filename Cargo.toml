@@ -1,0 +1,103 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustakka-langgraph-core",
+    "crates/rustakka-langgraph-checkpoint",
+    "crates/rustakka-langgraph-checkpoint-sqlite",
+    "crates/rustakka-langgraph-checkpoint-postgres",
+    "crates/rustakka-langgraph-store",
+    "crates/rustakka-langgraph-store-postgres",
+    "crates/rustakka-langgraph-prebuilt",
+    "crates/rustakka-langgraph-macros",
+    "crates/rustakka-langgraph",
+    "crates/rustakka-langgraph-profiler",
+    "crates/py-bindings/pylanggraph",
+    "examples/rust_pingpong",
+    "examples/rust_react_agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "Apache-2.0"
+repository = "https://github.com/cognect/rustakka-langgraph"
+authors = ["rustakka-langgraph contributors"]
+
+[workspace.dependencies]
+# rustakka actor runtime — pinned upstream commit on main
+rustakka              = { git = "https://github.com/cognect/rustakka", rev = "eda028ca0598a9ba258f350227b78a660882b5e3" }
+rustakka-core         = { git = "https://github.com/cognect/rustakka", rev = "eda028ca0598a9ba258f350227b78a660882b5e3" }
+rustakka-config       = { git = "https://github.com/cognect/rustakka", rev = "eda028ca0598a9ba258f350227b78a660882b5e3" }
+rustakka-persistence  = { git = "https://github.com/cognect/rustakka", rev = "eda028ca0598a9ba258f350227b78a660882b5e3" }
+
+# Async / runtime
+tokio        = { version = "1.39", features = ["full"] }
+tokio-util   = { version = "0.7" }
+async-trait  = "0.1"
+futures      = "0.3"
+futures-util = "0.3"
+pin-project-lite = "0.2"
+
+# Concurrency primitives
+dashmap      = "6"
+parking_lot  = "0.12"
+
+# Serialization
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+rmp-serde    = "1"
+bytes        = "1"
+
+# Database (checkpoint / store)
+sqlx         = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros", "json", "uuid", "chrono"] }
+
+# Errors / logging
+thiserror    = "1"
+anyhow       = "1"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+once_cell    = "1"
+
+# Utility
+uuid         = { version = "1", features = ["v4", "v7", "serde"] }
+chrono       = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# Macros
+proc-macro2  = "1"
+quote        = "1"
+syn          = { version = "2", features = ["full", "extra-traits"] }
+
+# Python bindings
+pyo3                = { version = "0.22", default-features = false, features = ["macros", "extension-module", "abi3-py39"] }
+pyo3-async-runtimes = { version = "0.22", default-features = false, features = ["tokio-runtime"] }
+
+# Testing
+tokio-test          = "0.4"
+
+# Internal workspace crates
+rustakka-langgraph-core               = { path = "crates/rustakka-langgraph-core",               version = "0.1.0" }
+rustakka-langgraph-checkpoint         = { path = "crates/rustakka-langgraph-checkpoint",         version = "0.1.0" }
+rustakka-langgraph-checkpoint-sqlite  = { path = "crates/rustakka-langgraph-checkpoint-sqlite",  version = "0.1.0" }
+rustakka-langgraph-checkpoint-postgres= { path = "crates/rustakka-langgraph-checkpoint-postgres",version = "0.1.0" }
+rustakka-langgraph-store              = { path = "crates/rustakka-langgraph-store",              version = "0.1.0" }
+rustakka-langgraph-store-postgres     = { path = "crates/rustakka-langgraph-store-postgres",     version = "0.1.0" }
+rustakka-langgraph-prebuilt           = { path = "crates/rustakka-langgraph-prebuilt",           version = "0.1.0" }
+rustakka-langgraph-macros             = { path = "crates/rustakka-langgraph-macros",             version = "0.1.0" }
+rustakka-langgraph                    = { path = "crates/rustakka-langgraph",                    version = "0.1.0", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+
+# Local-checkout override for fast iteration. Comment out to fetch from git.
+[patch."https://github.com/cognect/rustakka"]
+rustakka             = { path = "../rustakka/crates/rustakka" }
+rustakka-core        = { path = "../rustakka/crates/rustakka-core" }
+rustakka-config      = { path = "../rustakka/crates/rustakka-config" }
+rustakka-persistence = { path = "../rustakka/crates/rustakka-persistence" }

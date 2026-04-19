@@ -1,0 +1,24 @@
+[package]
+name = "rustakka-langgraph"
+description = "Umbrella facade re-exporting all rustakka-langgraph subcrates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["sqlite"]
+sqlite   = ["dep:rustakka-langgraph-checkpoint-sqlite"]
+postgres = ["dep:rustakka-langgraph-checkpoint-postgres", "dep:rustakka-langgraph-store-postgres"]
+prebuilt = ["dep:rustakka-langgraph-prebuilt"]
+full     = ["sqlite", "postgres", "prebuilt"]
+
+[dependencies]
+rustakka-langgraph-core              = { workspace = true }
+rustakka-langgraph-checkpoint        = { workspace = true }
+rustakka-langgraph-store             = { workspace = true }
+rustakka-langgraph-checkpoint-sqlite = { workspace = true, optional = true }
+rustakka-langgraph-checkpoint-postgres = { workspace = true, optional = true }
+rustakka-langgraph-store-postgres    = { workspace = true, optional = true }
+rustakka-langgraph-prebuilt          = { workspace = true, optional = true }

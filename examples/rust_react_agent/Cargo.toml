@@ -1,0 +1,13 @@
+[package]
+name = "example-rust-react-agent"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+rustakka-langgraph              = { workspace = true, default-features = false, features = ["prebuilt"] }
+rustakka-langgraph-core         = { workspace = true }
+rustakka-langgraph-prebuilt     = { workspace = true }
+tokio       = { workspace = true }
+serde_json  = { workspace = true }
+anyhow      = { workspace = true }

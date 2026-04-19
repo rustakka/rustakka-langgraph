@@ -1,0 +1,22 @@
+[package]
+name = "rustakka-langgraph-profiler"
+description = "Cross-runtime profiler scenarios for rustakka-langgraph (mirrors rustakka-profiler)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rustakka-langgraph-profiler"
+path = "src/main.rs"
+
+[dependencies]
+rustakka-langgraph        = { workspace = true, default-features = false, features = ["sqlite"] }
+rustakka-langgraph-core   = { workspace = true }
+rustakka-langgraph-checkpoint = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+tokio            = { workspace = true }
+chrono           = { workspace = true }
+anyhow           = { workspace = true }

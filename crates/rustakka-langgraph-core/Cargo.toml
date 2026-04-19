@@ -1,0 +1,38 @@
+[package]
+name = "rustakka-langgraph-core"
+description = "Native-Rust LangGraph Pregel/BSP engine on top of rustakka actors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustakka-core    = { workspace = true }
+rustakka-config  = { workspace = true }
+tokio            = { workspace = true }
+async-trait      = { workspace = true }
+futures          = { workspace = true }
+futures-util     = { workspace = true }
+parking_lot      = { workspace = true }
+dashmap          = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+thiserror        = { workspace = true }
+anyhow           = { workspace = true }
+tracing          = { workspace = true }
+once_cell        = { workspace = true }
+uuid             = { workspace = true }
+chrono           = { workspace = true }
+
+rustakka-langgraph-macros = { workspace = true, optional = true }
+
+[features]
+default = ["macros"]
+macros = ["dep:rustakka-langgraph-macros"]
+
+[dev-dependencies]
+tokio        = { workspace = true }
+tokio-test   = { workspace = true }
+serde_json   = { workspace = true }
+tracing-subscriber = { workspace = true }
