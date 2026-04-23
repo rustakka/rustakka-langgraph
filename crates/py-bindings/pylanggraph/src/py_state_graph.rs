@@ -117,19 +117,34 @@ impl PyStateGraph {
         Ok(())
     }
 
-    #[pyo3(signature = (checkpointer=None, store=None, debug=None, _interrupt_before=None, _interrupt_after=None))]
+    #[pyo3(signature = (checkpointer=None, store=None, debug=None, interrupt_before=None, interrupt_after=None, recursion_limit=None, durability=None))]
     fn compile(
         &mut self,
         py: Python<'_>,
         checkpointer: Option<Bound<'_, PyAny>>,
         store: Option<Bound<'_, PyAny>>,
         debug: Option<bool>,
-        _interrupt_before: Option<Bound<'_, PyAny>>,
-        _interrupt_after: Option<Bound<'_, PyAny>>,
+        interrupt_before: Option<Bound<'_, PyAny>>,
+        interrupt_after: Option<Bound<'_, PyAny>>,
+        recursion_limit: Option<u32>,
+        durability: Option<String>,
     ) -> PyResult<PyCompiledStateGraph> {
         let g = self.inner.take().ok_or_else(already_compiled)?;
         let mut cfg = CompileConfig::default();
         cfg.debug = debug.unwrap_or(false);
+        cfg.recursion_limit = recursion_limit;
+        cfg.interrupt_before = extract_node_list(interrupt_before.as_ref())?;
+        cfg.interrupt_after = extract_node_list(interrupt_after.as_ref())?;
+        cfg.durability = match durability.as_deref() {
+            Some("async") => rustakka_langgraph_core::graph::Durability::Async,
+            Some("exit") => rustakka_langgraph_core::graph::Durability::Exit,
+            Some("sync") | None => rustakka_langgraph_core::graph::Durability::Sync,
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown durability mode `{other}`; expected sync|async|exit"
+                )))
+            }
+        };
         let compiled: CompiledStateGraph = py
             .allow_threads(|| {
                 pyo3_async_runtimes::tokio::get_runtime().block_on(async { g.compile(cfg).await })
@@ -140,6 +155,24 @@ impl PyStateGraph {
         wrapper.attach_store(py, store)?;
         Ok(wrapper)
     }
+}
+
+/// Accept either `None`, `"node_name"`, `["a", "b"]`, or the literal `"*"` to
+/// mirror upstream's permissive argument shape.
+fn extract_node_list(v: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<String>> {
+    let Some(v) = v else { return Ok(Vec::new()) };
+    if v.is_none() {
+        return Ok(Vec::new());
+    }
+    if let Ok(s) = v.extract::<String>() {
+        return Ok(vec![s]);
+    }
+    if let Ok(list) = v.extract::<Vec<String>>() {
+        return Ok(list);
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "interrupt_before/interrupt_after must be a string or list of strings",
+    ))
 }
 
 fn already_compiled() -> PyErr {

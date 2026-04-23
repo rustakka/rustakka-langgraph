@@ -63,11 +63,61 @@ impl<C: Checkpointer> CheckpointerHook for CheckpointerHookAdapter<C> {
     }
 
     async fn get_latest(&self, cfg: &RunnableConfig) -> GraphResult<Option<CheckpointReplay>> {
+        // Latest = get_tuple with no checkpoint_id.
+        let mut effective = cfg.clone();
+        effective.checkpoint_id = None;
+        let Some(tup) = self.inner.get_tuple(&effective).await? else { return Ok(None) };
+        Ok(Some(CheckpointReplay {
+            step: tup.checkpoint.step,
+            snapshot: tup.checkpoint.channel_snapshots,
+            interrupt: tup.checkpoint.interrupt,
+        }))
+    }
+
+    async fn get_at(&self, cfg: &RunnableConfig) -> GraphResult<Option<CheckpointReplay>> {
+        // Honors `cfg.checkpoint_id` for time-travel resume.
         let Some(tup) = self.inner.get_tuple(cfg).await? else { return Ok(None) };
         Ok(Some(CheckpointReplay {
             step: tup.checkpoint.step,
             snapshot: tup.checkpoint.channel_snapshots,
             interrupt: tup.checkpoint.interrupt,
         }))
+    }
+
+    async fn put_writes(
+        &self,
+        cfg: &RunnableConfig,
+        task_id: &str,
+        writes: &[(String, Value)],
+    ) -> GraphResult<()> {
+        let pw: Vec<PendingWrite> = writes
+            .iter()
+            .map(|(ch, v)| PendingWrite {
+                task_id: task_id.to_string(),
+                channel: ch.clone(),
+                value: v.clone(),
+            })
+            .collect();
+        self.inner.put_writes(cfg, &pw, task_id).await
+    }
+
+    async fn list_checkpoints(
+        &self,
+        cfg: &RunnableConfig,
+        limit: Option<u32>,
+    ) -> GraphResult<Vec<CheckpointReplay>> {
+        use futures::StreamExt;
+        let filter = crate::base::ListFilter { limit, ..Default::default() };
+        let mut stream = self.inner.list(cfg, filter);
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let tup = item?;
+            out.push(CheckpointReplay {
+                step: tup.checkpoint.step,
+                snapshot: tup.checkpoint.channel_snapshots,
+                interrupt: tup.checkpoint.interrupt,
+            });
+        }
+        Ok(out)
     }
 }

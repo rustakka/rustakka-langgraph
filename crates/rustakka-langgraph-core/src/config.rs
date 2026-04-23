@@ -14,6 +14,25 @@ pub enum StreamMode {
     Messages,
     Custom,
     Debug,
+    /// Upstream `astream_events()` v2 event kinds
+    /// (`on_chain_start`, `on_chain_end`, `on_chat_model_stream`,
+    /// `on_tool_start`, `on_tool_end`).
+    Events,
+}
+
+impl StreamMode {
+    /// Case-insensitive parse matching upstream's Python string literals.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "values" => StreamMode::Values,
+            "updates" => StreamMode::Updates,
+            "messages" => StreamMode::Messages,
+            "custom" => StreamMode::Custom,
+            "debug" => StreamMode::Debug,
+            "events" => StreamMode::Events,
+            _ => return None,
+        })
+    }
 }
 
 impl Default for StreamMode {

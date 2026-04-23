@@ -11,6 +11,7 @@ members = [
     "crates/rustakka-langgraph-macros",
     "crates/rustakka-langgraph",
     "crates/rustakka-langgraph-profiler",
+    "crates/rustakka-langgraph-providers",
     "crates/py-bindings/pylanggraph",
     "examples/rust_pingpong",
     "examples/rust_react_agent",
@@ -35,6 +36,7 @@ rustakka-persistence  = { git = "https://github.com/cognect/rustakka", rev = "ed
 tokio        = { version = "1.39", features = ["full"] }
 tokio-util   = { version = "0.7" }
 async-trait  = "0.1"
+async-stream = "0.3"
 futures      = "0.3"
 futures-util = "0.3"
 pin-project-lite = "0.2"
@@ -85,6 +87,7 @@ rustakka-langgraph-store-postgres     = { path = "crates/rustakka-langgraph-stor
 rustakka-langgraph-prebuilt           = { path = "crates/rustakka-langgraph-prebuilt",           version = "0.1.0" }
 rustakka-langgraph-macros             = { path = "crates/rustakka-langgraph-macros",             version = "0.1.0" }
 rustakka-langgraph                    = { path = "crates/rustakka-langgraph",                    version = "0.1.0", default-features = false }
+rustakka-langgraph-providers          = { path = "crates/rustakka-langgraph-providers",          version = "0.1.0", default-features = false }
 
 [profile.release]
 opt-level = 3

@@ -25,6 +25,7 @@
 pub mod channel;
 pub mod command;
 pub mod config;
+pub mod context;
 pub mod coordinator;
 pub mod errors;
 pub mod graph;
@@ -32,6 +33,7 @@ pub mod node;
 pub mod runner;
 pub mod state;
 pub mod stream;
+pub mod visualize;
 
 pub mod prelude {
     //! Common imports for graph authors.
@@ -39,7 +41,10 @@ pub mod prelude {
     pub use crate::command::{Command, Interrupt, Send};
     pub use crate::config::{RunnableConfig, StreamMode};
     pub use crate::errors::{GraphError, GraphResult};
-    pub use crate::graph::{CompileConfig, CompiledStateGraph, StateGraph, END, START};
+    pub use crate::graph::{
+        CachePolicy, CompileConfig, CompiledStateGraph, Durability, RetryPolicy, StateGraph, END,
+        START,
+    };
     pub use crate::node::{NodeFn, NodeKind, NodeOutput};
     pub use crate::state::{ChannelSpec, GraphState, GraphValues};
     pub use crate::stream::StreamEvent;

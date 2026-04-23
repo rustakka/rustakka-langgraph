@@ -226,6 +226,233 @@ async fn compiled_subgraph_as_node() {
     assert_eq!(out["n"], json!(8));
 }
 
+// --------------------------------------------- Command(graph=PARENT) ------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subgraph_command_graph_parent_propagates() {
+    // Child graph: emits Command(graph=PARENT, goto="done", update={"from":"child"}).
+    let mut child = StateGraph::<DynamicState>::new();
+    child
+        .add_node(
+            "handoff",
+            NodeKind::from_fn(|_| async move {
+                let mut cmd = Command::default().with_goto("done");
+                cmd.update.insert("from".into(), json!("child"));
+                cmd.graph = Some("PARENT".into());
+                Ok(NodeOutput::Command(cmd))
+            }),
+        )
+        .unwrap();
+    child.add_edge(START, "handoff");
+    child.add_edge("handoff", END);
+    let compiled_child = Arc::new(child.compile(CompileConfig::default()).await.unwrap());
+
+    // Parent graph: has a `done` node reached via parent-bound command.
+    let mut parent = StateGraph::<DynamicState>::new();
+    parent
+        .add_node(
+            "bridge",
+            NodeKind::Subgraph(compiled_child.clone().as_subgraph_invoker()),
+        )
+        .unwrap();
+    parent
+        .add_node(
+            "done",
+            NodeKind::from_fn(|_| async move {
+                let mut m = BTreeMap::new();
+                m.insert("reached".into(), json!(true));
+                Ok(NodeOutput::Update(m))
+            }),
+        )
+        .unwrap();
+    parent.add_edge(START, "bridge");
+    parent.add_edge("done", END);
+
+    let app = Arc::new(parent.compile(CompileConfig::default()).await.unwrap());
+    let out = invoke_dynamic(app, BTreeMap::new(), RunnableConfig::default()).await.unwrap();
+    // The child's parent-bound Command should have routed us to `done`
+    // and written `from="child"` into parent channels.
+    assert_eq!(out["from"], json!("child"));
+    assert_eq!(out["reached"], json!(true));
+}
+
+// --------------------------------- Checkpointer::put_writes is called -----
+
+#[derive(Default)]
+struct CountingSaver {
+    step_calls: std::sync::atomic::AtomicU32,
+    writes_calls: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl CheckpointerHook for CountingSaver {
+    async fn put_step(
+        &self,
+        _cfg: &RunnableConfig,
+        _step: u64,
+        _values: &BTreeMap<String, serde_json::Value>,
+        _snapshot: &BTreeMap<String, ChannelSnapshot>,
+        _pending_writes: &[(String, BTreeMap<String, serde_json::Value>)],
+        _interrupt: Option<&Interrupt>,
+    ) -> GraphResult<()> {
+        self.step_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn get_latest(
+        &self,
+        _cfg: &RunnableConfig,
+    ) -> GraphResult<Option<CheckpointReplay>> {
+        Ok(None)
+    }
+    async fn put_writes(
+        &self,
+        _cfg: &RunnableConfig,
+        _task_id: &str,
+        _writes: &[(String, serde_json::Value)],
+    ) -> GraphResult<()> {
+        self.writes_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpointer_put_writes_is_called_per_node() {
+    let mut g = StateGraph::<DynamicState>::new();
+    g.add_node("a", NodeKind::from_fn(|_| async move {
+        let mut m = BTreeMap::new();
+        m.insert("x".into(), json!(1));
+        Ok(NodeOutput::Update(m))
+    }))
+    .unwrap();
+    g.add_node("b", NodeKind::from_fn(|_| async move {
+        let mut m = BTreeMap::new();
+        m.insert("y".into(), json!(2));
+        Ok(NodeOutput::Update(m))
+    }))
+    .unwrap();
+    g.add_edge(START, "a");
+    g.add_edge("a", "b");
+    g.add_edge("b", END);
+    let app = Arc::new(g.compile(CompileConfig::default()).await.unwrap());
+
+    let saver = Arc::new(CountingSaver::default());
+    let hook: Arc<dyn CheckpointerHook> = saver.clone();
+    let _ = invoke_with_checkpointer(
+        app,
+        BTreeMap::new(),
+        RunnableConfig::with_thread("t-writes"),
+        hook,
+    )
+    .await
+    .unwrap();
+    assert!(saver.writes_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    assert!(saver.step_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+}
+
+// --------------------------------- State inspection (get/update_state) ---
+
+#[derive(Default, Clone)]
+struct ChainSaver {
+    inner: Arc<std::sync::Mutex<Vec<(u64, BTreeMap<String, ChannelSnapshot>, Option<Interrupt>)>>>,
+}
+
+#[async_trait::async_trait]
+impl CheckpointerHook for ChainSaver {
+    async fn put_step(
+        &self,
+        _cfg: &RunnableConfig,
+        step: u64,
+        _values: &BTreeMap<String, serde_json::Value>,
+        snapshot: &BTreeMap<String, ChannelSnapshot>,
+        _pending_writes: &[(String, BTreeMap<String, serde_json::Value>)],
+        interrupt: Option<&Interrupt>,
+    ) -> GraphResult<()> {
+        self.inner.lock().unwrap().push((step, snapshot.clone(), interrupt.cloned()));
+        Ok(())
+    }
+    async fn get_latest(
+        &self,
+        _cfg: &RunnableConfig,
+    ) -> GraphResult<Option<CheckpointReplay>> {
+        Ok(self.inner.lock().unwrap().last().map(|(s, snap, intr)| CheckpointReplay {
+            step: *s,
+            snapshot: snap.clone(),
+            interrupt: intr.clone(),
+        }))
+    }
+    async fn list_checkpoints(
+        &self,
+        _cfg: &RunnableConfig,
+        limit: Option<u32>,
+    ) -> GraphResult<Vec<CheckpointReplay>> {
+        let mut v: Vec<_> = self
+            .inner
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .map(|(s, snap, intr)| CheckpointReplay {
+                step: *s,
+                snapshot: snap.clone(),
+                interrupt: intr.clone(),
+            })
+            .collect();
+        if let Some(l) = limit {
+            v.truncate(l as usize);
+        }
+        Ok(v)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn state_inspection_end_to_end() {
+    use rustakka_langgraph_core::runner::{get_state, get_state_history, update_state};
+
+    let mut g = StateGraph::<DynamicState>::new();
+    g.add_node("a", NodeKind::from_fn(|_| async move {
+        let mut m = BTreeMap::new();
+        m.insert("count".into(), json!(1));
+        Ok(NodeOutput::Update(m))
+    }))
+    .unwrap();
+    g.add_node("b", NodeKind::from_fn(|input| async move {
+        let n = input.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+        let mut m = BTreeMap::new();
+        m.insert("count".into(), json!(n + 10));
+        Ok(NodeOutput::Update(m))
+    }))
+    .unwrap();
+    g.add_edge(START, "a");
+    g.add_edge("a", "b");
+    g.add_edge("b", END);
+    let app = Arc::new(g.compile(CompileConfig::default()).await.unwrap());
+
+    let saver = Arc::new(ChainSaver::default());
+    let hook: Arc<dyn CheckpointerHook> = saver.clone();
+    let cfg = RunnableConfig::with_thread("t-inspect");
+
+    let _ = invoke_with_checkpointer(app.clone(), BTreeMap::new(), cfg.clone(), hook.clone())
+        .await
+        .unwrap();
+
+    // get_state returns the latest checkpoint.
+    let latest = get_state(&app, &cfg, hook.clone()).await.unwrap().unwrap();
+    assert_eq!(latest.values["count"], json!(11));
+
+    // history has >= 2 entries (one per superstep).
+    let hist = get_state_history(&app, &cfg, hook.clone(), None).await.unwrap();
+    assert!(hist.len() >= 2);
+
+    // update_state patches without running a node.
+    let mut patch = BTreeMap::new();
+    patch.insert("count".into(), json!(999));
+    let _ = update_state(&app, &cfg, hook.clone(), patch, Some("manual".into()))
+        .await
+        .unwrap();
+    let after = get_state(&app, &cfg, hook).await.unwrap().unwrap();
+    assert_eq!(after.values["count"], json!(999));
+}
+
 // Prevent unused-import warnings in the integration-test binary
 fn _unused() {
     let _ = GraphError::EmptyInput;

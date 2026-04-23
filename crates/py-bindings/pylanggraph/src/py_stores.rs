@@ -13,7 +13,7 @@ use crate::conversions::{json_to_py, py_to_json};
 #[pyclass(name = "InMemoryStore", module = "rustakka_langgraph._native")]
 #[derive(Clone)]
 pub struct PyInMemoryStore {
-    inner: Arc<InMemoryStore>,
+    pub(crate) inner: Arc<InMemoryStore>,
 }
 
 #[pymethods]

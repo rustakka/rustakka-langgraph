@@ -6,8 +6,12 @@ An idiomatic, native-Rust port of
 with a `pyo3`-powered Python shim that keeps the upstream `langgraph` API
 drop-in compatible.
 
-All nine plan phases (0–8) are implemented. See
-[docs/TODO.md](docs/TODO.md) for the checklist and
+All ten plan phases (0–9) are implemented — including Phase 9's
+feature-gap closure against upstream LangGraph v0.4+ (state inspection,
+multi-mode streaming + `subgraphs=True`, `astream_events` v2, store
+injection with semantic search, `CachePolicy`, durability modes,
+supervisor / swarm prebuilts, Mermaid & ASCII graph visualization).
+See [docs/TODO.md](docs/TODO.md) for the checklist and
 [docs/architecture.md](docs/architecture.md) for a deep-dive.
 
 ## Why
@@ -31,13 +35,14 @@ engine to Rust on top of rustakka actors we get:
 
 ```
 crates/
-  rustakka-langgraph-core/                Pregel engine + channels + state
+  rustakka-langgraph-core/                Pregel engine + channels + state + visualization
   rustakka-langgraph-checkpoint/          Checkpointer trait + MemorySaver
   rustakka-langgraph-checkpoint-sqlite/   sqlx SqliteSaver (schema parity)
   rustakka-langgraph-checkpoint-postgres/ sqlx PostgresSaver + AsyncPostgresSaver
-  rustakka-langgraph-store/               BaseStore trait + InMemoryStore
+  rustakka-langgraph-store/               BaseStore + InMemoryStore + Embedder + StoreAccessor
   rustakka-langgraph-store-postgres/      PostgresStore + AsyncPostgresStore
-  rustakka-langgraph-prebuilt/            create_react_agent, ToolNode, tools_condition
+  rustakka-langgraph-providers/           OpenAI / Azure / Vertex / Ollama / Bedrock chat-model clients
+  rustakka-langgraph-prebuilt/            create_react_agent, create_supervisor, create_swarm, ToolNode
   rustakka-langgraph-macros/              #[derive(GraphState)], #[node]
   rustakka-langgraph/                     Umbrella facade (feature-gated)
   rustakka-langgraph-profiler/            Cross-runtime profiler scenarios
@@ -146,7 +151,7 @@ workflow({"x": 6})  # -> {"x": 36}
 ## Building & testing
 
 ```bash
-# Rust: 30 tests across 10 crates
+# Rust: 67 tests across 11 crates
 cargo build --workspace
 cargo test  --workspace
 
@@ -171,12 +176,20 @@ configuration follows the standard 12-factor pattern; look for
 ## Docs
 
 - [docs/architecture.md](docs/architecture.md) — engine, coordinator
-  barrier, channels, GIL discipline
-- [docs/python.md](docs/python.md) — Python facade + compatibility notes
+  barrier, channels, store injection, durability, visualization,
+  GIL discipline
+- [docs/python.md](docs/python.md) — Python facade + compatibility
+  matrix (invoke / stream / get_state / with_config / draw_mermaid / …)
 - [docs/checkpointing.md](docs/checkpointing.md) — Memory / SQLite /
-  Postgres savers and schema parity
-- [docs/streaming.md](docs/streaming.md) — Values / Updates / Messages /
-  Custom / Debug streaming modes
+  Postgres savers, durability modes, time-travel, `update_state`
+- [docs/streaming.md](docs/streaming.md) — Values / Updates / Messages
+  / Custom / Debug + `astream_events` v2 + `subgraphs=True`
+- [docs/store.md](docs/store.md) — `BaseStore`, store injection into
+  nodes, and `InMemoryStore::with_embedder(...)` semantic search
+- [docs/prebuilt.md](docs/prebuilt.md) — `create_react_agent`,
+  `create_supervisor`, `create_swarm`, `ToolNode` / `tools_condition`
 - [docs/TODO.md](docs/TODO.md) — phase-by-phase implementation status
 - [resources/Rust LangGraph with Python Bridge.md](resources/Rust%20LangGraph%20with%20Python%20Bridge.md)
   — original architectural specification
+- [resources/Rustakka LangGraph Provider Plan.md](resources/Rustakka%20LangGraph%20Provider%20Plan.md)
+  — provider-crate plan (OpenAI / Azure / Vertex / Ollama / Bedrock)

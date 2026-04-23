@@ -34,6 +34,47 @@ pub struct RetryPolicy {
     pub backoff_ms: u64,
 }
 
+/// Function used to derive a cache key from a node's input map. Mirrors
+/// upstream's `CachePolicy(key_func=...)`.
+pub type CacheKeyFn = Arc<
+    dyn Fn(&BTreeMap<String, Value>) -> String + Send + Sync + 'static,
+>;
+
+/// Per-node cache policy. If a node produces the same `key_func(input)`
+/// within `ttl_seconds` (unbounded when `None`), the prior `NodeOutput` is
+/// replayed instead of re-executing.
+#[derive(Clone)]
+pub struct CachePolicy {
+    pub key_func: CacheKeyFn,
+    pub ttl_seconds: Option<u64>,
+}
+
+impl std::fmt::Debug for CachePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachePolicy")
+            .field("ttl_seconds", &self.ttl_seconds)
+            .finish()
+    }
+}
+
+impl CachePolicy {
+    /// Default: serialize the whole input map as JSON for the cache key.
+    pub fn default_key() -> CacheKeyFn {
+        Arc::new(|input: &BTreeMap<String, Value>| {
+            serde_json::to_string(input).unwrap_or_default()
+        })
+    }
+
+    pub fn new(ttl_seconds: Option<u64>) -> Self {
+        Self { key_func: Self::default_key(), ttl_seconds }
+    }
+
+    pub fn with_key(mut self, f: CacheKeyFn) -> Self {
+        self.key_func = f;
+        self
+    }
+}
+
 /// Conditional edge: a router function evaluated on the current state map
 /// returning the next node target(s).
 pub type RouterFn = Arc<
@@ -68,6 +109,7 @@ struct GraphBuild {
     finish_point: Option<String>,
     extra_channels: Vec<ChannelSpec>,
     retries: HashMap<String, RetryPolicy>,
+    caches: HashMap<String, CachePolicy>,
 }
 
 /// Builder counterpart of `langgraph.graph.StateGraph(state_schema)`.
@@ -143,6 +185,19 @@ impl<S: GraphState> StateGraph<S> {
         self
     }
 
+    /// Attach a [`CachePolicy`] to `node`. Subsequent invocations with the
+    /// same `key_func(input)` replay the cached [`NodeOutput`] (subject to
+    /// `ttl_seconds`). Mirrors upstream
+    /// `add_node(..., cache_policy=CachePolicy(...))`.
+    pub fn set_cache_policy(
+        &mut self,
+        name: impl Into<String>,
+        policy: CachePolicy,
+    ) -> &mut Self {
+        self.build.caches.insert(name.into(), policy);
+        self
+    }
+
     /// Validate + freeze into a [`CompiledStateGraph`].
     pub async fn compile(self, cfg: CompileConfig) -> GraphResult<CompiledStateGraph> {
         let GraphBuild {
@@ -153,6 +208,7 @@ impl<S: GraphState> StateGraph<S> {
             finish_point,
             extra_channels,
             retries,
+            caches,
         } = self.build;
 
         if nodes.is_empty() {
@@ -195,10 +251,14 @@ impl<S: GraphState> StateGraph<S> {
             finish_point,
             channel_specs: specs,
             retries,
+            caches,
             cfg,
         });
 
-        Ok(CompiledStateGraph { topology })
+        Ok(CompiledStateGraph {
+            topology,
+            cache: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        })
     }
 }
 
@@ -210,6 +270,34 @@ pub struct CompileConfig {
     /// compile time. The actual saver is supplied at runtime via
     /// `CompiledStateGraph::with_checkpointer`.
     pub checkpointer_id: Option<String>,
+    /// Static breakpoint: pause with an Interrupt *before* any of these nodes
+    /// executes. Mirrors upstream `compile(interrupt_before=[...])`.
+    #[serde(default)]
+    pub interrupt_before: Vec<String>,
+    /// Static breakpoint: pause with an Interrupt *after* any of these nodes
+    /// writes. Mirrors upstream `compile(interrupt_after=[...])`.
+    #[serde(default)]
+    pub interrupt_after: Vec<String>,
+    /// Checkpoint-flush policy: `Sync` persists after every update phase
+    /// (default, strongest guarantee), `Async` spawns the saver call,
+    /// `Exit` defers all writes until the run completes. Mirrors upstream
+    /// `compile(durability=...)`.
+    #[serde(default)]
+    pub durability: Durability,
+}
+
+/// Checkpoint-flush timing. Mirrors upstream's `durability` argument
+/// (`"sync" | "async" | "exit"`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    /// Await the saver inside the update phase (safest, default).
+    #[default]
+    Sync,
+    /// Spawn the saver call and continue; errors are surfaced via tracing.
+    Async,
+    /// Only persist at run-exit (final step).
+    Exit,
 }
 
 // ---------------------------- compiled side ----------------------------
@@ -223,8 +311,18 @@ pub struct GraphTopology {
     pub finish_point: Option<String>,
     pub channel_specs: Vec<ChannelSpec>,
     pub retries: HashMap<String, RetryPolicy>,
+    pub caches: HashMap<String, CachePolicy>,
     pub cfg: CompileConfig,
 }
+
+/// Entry in the per-graph node-output cache.
+#[derive(Clone)]
+pub struct CacheEntry {
+    pub value: BTreeMap<String, Value>,
+    pub expires_at: Option<std::time::Instant>,
+}
+
+pub type NodeCache = parking_lot::RwLock<HashMap<(String, String), CacheEntry>>;
 
 impl std::fmt::Debug for GraphTopology {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -282,11 +380,18 @@ impl GraphTopology {
 #[derive(Clone)]
 pub struct CompiledStateGraph {
     pub(crate) topology: Arc<GraphTopology>,
+    /// Per-graph node-output cache keyed by `(node_name, cache_key)`.
+    /// Shared across invocations of the same compiled graph.
+    pub(crate) cache: Arc<NodeCache>,
 }
 
 impl CompiledStateGraph {
     pub fn topology(&self) -> &Arc<GraphTopology> {
         &self.topology
+    }
+
+    pub fn node_cache(&self) -> &Arc<NodeCache> {
+        &self.cache
     }
 
     pub fn channel_specs(&self) -> &[ChannelSpec] {
@@ -297,6 +402,18 @@ impl CompiledStateGraph {
     /// in as a node inside a parent graph.
     pub fn as_subgraph_invoker(self: Arc<Self>) -> Arc<dyn SubgraphInvoker> {
         Arc::new(SubgraphAdapter { inner: self })
+    }
+
+    /// Render this graph as a Mermaid `flowchart TD` diagram. Mirrors
+    /// upstream `get_graph().draw_mermaid()`.
+    pub fn draw_mermaid(&self) -> String {
+        crate::visualize::draw_mermaid(self)
+    }
+
+    /// Render a minimal ASCII overview (nodes + edges). Mirrors upstream
+    /// `get_graph().draw_ascii()`.
+    pub fn draw_ascii(&self) -> String {
+        crate::visualize::draw_ascii(self)
     }
 }
 
@@ -313,8 +430,29 @@ impl SubgraphInvoker for SubgraphAdapter {
         let inner = self.inner.clone();
         Box::pin(async move {
             let cfg = RunnableConfig::default();
-            let out = crate::runner::invoke_dynamic(inner, input, cfg).await?;
-            Ok(NodeOutput::Update(out))
+
+            // If the parent coordinator installed a `CURRENT_WRITER` for the
+            // subgraph node, inherit its bus so events from the child graph
+            // surface to parent subscribers with a namespaced prefix.
+            let parent_ctx = crate::stream::current_writer();
+
+            let res = crate::runner::run_internal_with_parent(
+                inner,
+                input,
+                cfg,
+                None,
+                None,
+                parent_ctx.map(|w| {
+                    let mut ns = w.namespace().to_vec();
+                    ns.push(w.node().to_string());
+                    (w.bus().clone(), ns)
+                }),
+            )
+            .await?;
+            if let Some(cmd) = res.parent_command {
+                return Ok(NodeOutput::Command(cmd));
+            }
+            Ok(NodeOutput::Update(res.values))
         })
     }
 }

@@ -104,9 +104,50 @@ On each `StartRun`:
    (possibly restored) values. This is what makes a completed thread
    accept another invocation to extend its state.
 
+After every completed node, the coordinator calls
+`Checkpointer::put_writes` with that task's writes — so an in-flight
+fan-out step can be replayed on crash without re-running tasks that
+already succeeded.
+
 At the end of every Update phase, `put_step` writes the new snapshot,
 including every reducer's post-write value plus any pending writes that
 came from `Command::update` or `Send`.
+
+### Durability modes
+
+`CompileConfig.durability` (mirrors upstream's
+`compile(durability="sync"|"async"|"exit")`) controls when the snapshot
+is flushed:
+
+| Mode | Behaviour |
+| --- | --- |
+| `Sync` (default) | Await the saver inside the Update phase. `invoke()` returns only after the snapshot is durable. |
+| `Async` | Spawn the saver call; the run continues immediately. Errors surface via `tracing::warn!`. |
+| `Exit` | Defer every snapshot until the run completes, then write a single final checkpoint. |
+
+`put_writes` always runs synchronously — only the end-of-step snapshot
+observes the mode. From Python:
+
+```python
+app = g.compile(checkpointer=MemorySaver(), durability="async")
+```
+
+### Time-travel and state inspection
+
+`runner::get_state(app, cfg, cp)` returns the latest snapshot (or the
+one at `cfg.checkpoint_id`) as a `StateSnapshot { values, step,
+interrupt, config }`. `runner::get_state_history(app, cfg, cp, limit)`
+lists prior checkpoints, newest-first. `runner::update_state(app, cfg,
+cp, patch, as_node)` applies a manual write without running a node —
+the coordinator persists the patch via `put_writes` and writes a fresh
+snapshot so the next `invoke` sees the updated state.
+
+From Python these appear as
+`CompiledStateGraph.get_state(config=…)`,
+`.get_state_history(config=…, limit=…)`, and
+`.update_state(config, values, as_node=None)`. `with_config(config)`
+returns a new handle whose `configurable` / `recursion_limit` are
+merged into every subsequent call.
 
 ## Schema parity
 

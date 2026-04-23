@@ -1,0 +1,46 @@
+[package]
+name = "rustakka-langgraph-providers"
+description = "LLM provider integrations (OpenAI, Ollama, Bedrock, etc.) for rustakka-langgraph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["openai"]
+openai  = ["dep:reqwest", "dep:reqwest-eventsource"]
+ollama  = ["dep:reqwest"]
+bedrock = ["dep:aws-sdk-bedrockruntime", "dep:aws-config", "dep:aws-smithy-types"]
+azure   = ["openai"]
+vertex  = ["dep:reqwest", "dep:reqwest-eventsource", "dep:gcp_auth"]
+mock    = []
+full    = ["openai", "ollama", "bedrock", "azure", "vertex", "mock"]
+
+[dependencies]
+async-trait  = { workspace = true }
+async-stream = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+tokio        = { workspace = true }
+tokio-util   = { workspace = true, features = ["io"] }
+futures      = { workspace = true }
+futures-util = { workspace = true }
+pin-project-lite = { workspace = true }
+uuid         = { workspace = true }
+bytes        = { workspace = true }
+
+# Provider-specific (optional)
+reqwest              = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"], optional = true }
+reqwest-eventsource  = { version = "0.6", optional = true }
+aws-sdk-bedrockruntime = { version = "1", optional = true }
+aws-config           = { version = "1", optional = true }
+aws-smithy-types     = { version = "1", optional = true }
+gcp_auth             = { version = "0.12", optional = true }
+
+[dev-dependencies]
+tokio    = { workspace = true }
+serde_json = { workspace = true }
+wiremock = "0.6"

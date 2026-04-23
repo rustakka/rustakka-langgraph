@@ -17,5 +17,13 @@ anyhow      = { workspace = true }
 tokio       = { workspace = true }
 futures     = { workspace = true }
 
+rustakka-langgraph-providers = { workspace = true, optional = true }
+uuid        = { workspace = true, optional = true }
+
+[features]
+default = []
+providers = ["dep:rustakka-langgraph-providers", "dep:uuid"]
+
 [dev-dependencies]
-tokio = { workspace = true }
+tokio      = { workspace = true }
+rustakka-langgraph-providers = { workspace = true, features = ["mock"] }

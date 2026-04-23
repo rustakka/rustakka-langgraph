@@ -15,19 +15,98 @@ use crate::config::StreamMode;
 
 /// Upstream `langgraph` mirrors stream events as plain dicts; we keep them
 /// strongly typed and serializable.
+///
+/// The `namespace` field is `Vec<String>` (empty for root graph, populated
+/// with the ancestor node path when emitted from a subgraph under
+/// `stream(..., subgraphs=True)`). It's a separate field rather than a
+/// variant because every event is equally nestable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StreamEvent {
     /// Full state after each superstep.
-    Values { step: u64, values: BTreeMap<String, Value> },
+    Values {
+        step: u64,
+        values: BTreeMap<String, Value>,
+        #[serde(default)]
+        namespace: Vec<String>,
+    },
     /// Per-node updates emitted at the end of the step.
-    Updates { step: u64, node: String, update: BTreeMap<String, Value> },
+    Updates {
+        step: u64,
+        node: String,
+        update: BTreeMap<String, Value>,
+        #[serde(default)]
+        namespace: Vec<String>,
+    },
     /// Chat-message stream (token chunks or full BaseMessage dicts).
-    Messages { step: u64, node: String, message: Value },
+    Messages {
+        step: u64,
+        node: String,
+        message: Value,
+        #[serde(default)]
+        namespace: Vec<String>,
+    },
     /// User-emitted custom payloads via `get_stream_writer()(...)`.
-    Custom { step: u64, node: String, payload: Value },
+    Custom {
+        step: u64,
+        node: String,
+        payload: Value,
+        #[serde(default)]
+        namespace: Vec<String>,
+    },
     /// Verbose debug events (planning, dispatch, halt).
-    Debug { step: u64, payload: Value },
+    Debug {
+        step: u64,
+        payload: Value,
+        #[serde(default)]
+        namespace: Vec<String>,
+    },
+    // ----- astream_events v2 event kinds -----
+    /// Fired when a node starts executing. Mirrors `on_chain_start`.
+    OnChainStart {
+        step: u64,
+        node: String,
+        run_id: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        namespace: Vec<String>,
+    },
+    /// Fired after a node emits its writes. Mirrors `on_chain_end`.
+    OnChainEnd {
+        step: u64,
+        node: String,
+        run_id: Option<String>,
+        output: Value,
+        #[serde(default)]
+        namespace: Vec<String>,
+    },
+    /// Token-level chunks from an LLM. Mirrors `on_chat_model_stream`.
+    OnChatModelStream {
+        step: u64,
+        node: String,
+        chunk: Value,
+        #[serde(default)]
+        namespace: Vec<String>,
+    },
+    /// Fired when a tool starts executing. Mirrors `on_tool_start`.
+    OnToolStart {
+        step: u64,
+        node: String,
+        tool: String,
+        input: Value,
+        #[serde(default)]
+        namespace: Vec<String>,
+    },
+    /// Fired when a tool finishes. Mirrors `on_tool_end`.
+    OnToolEnd {
+        step: u64,
+        node: String,
+        tool: String,
+        output: Value,
+        #[serde(default)]
+        namespace: Vec<String>,
+    },
 }
 
 impl StreamEvent {
@@ -38,6 +117,47 @@ impl StreamEvent {
             StreamEvent::Messages { .. } => StreamMode::Messages,
             StreamEvent::Custom { .. } => StreamMode::Custom,
             StreamEvent::Debug { .. } => StreamMode::Debug,
+            // All v2 events map onto the "events" mode, which is distinct
+            // from the classic `stream_mode` strings.
+            StreamEvent::OnChainStart { .. }
+            | StreamEvent::OnChainEnd { .. }
+            | StreamEvent::OnChatModelStream { .. }
+            | StreamEvent::OnToolStart { .. }
+            | StreamEvent::OnToolEnd { .. } => StreamMode::Events,
+        }
+    }
+
+    /// Event-kind string matching upstream's Python strings
+    /// (`"values" | "updates" | "messages" | "custom" | "debug" | "events"`).
+    pub fn mode_string(&self) -> &'static str {
+        match self {
+            StreamEvent::Values { .. } => "values",
+            StreamEvent::Updates { .. } => "updates",
+            StreamEvent::Messages { .. } => "messages",
+            StreamEvent::Custom { .. } => "custom",
+            StreamEvent::Debug { .. } => "debug",
+            StreamEvent::OnChainStart { .. }
+            | StreamEvent::OnChainEnd { .. }
+            | StreamEvent::OnChatModelStream { .. }
+            | StreamEvent::OnToolStart { .. }
+            | StreamEvent::OnToolEnd { .. } => "events",
+        }
+    }
+
+    /// Mutable access to the namespace. Used when forwarding events across
+    /// subgraph boundaries so the parent bus sees `(ancestor_node, ...)`.
+    pub fn namespace_mut(&mut self) -> &mut Vec<String> {
+        match self {
+            StreamEvent::Values { namespace, .. }
+            | StreamEvent::Updates { namespace, .. }
+            | StreamEvent::Messages { namespace, .. }
+            | StreamEvent::Custom { namespace, .. }
+            | StreamEvent::Debug { namespace, .. }
+            | StreamEvent::OnChainStart { namespace, .. }
+            | StreamEvent::OnChainEnd { namespace, .. }
+            | StreamEvent::OnChatModelStream { namespace, .. }
+            | StreamEvent::OnToolStart { namespace, .. }
+            | StreamEvent::OnToolEnd { namespace, .. } => namespace,
         }
     }
 }
@@ -90,11 +210,36 @@ pub struct StreamWriter {
     bus: StreamBus,
     step: u64,
     node: String,
+    /// Subgraph ancestor path; empty for the root graph.
+    namespace: Vec<String>,
 }
 
 impl StreamWriter {
     pub fn new(bus: StreamBus, step: u64, node: impl Into<String>) -> Self {
-        Self { bus, step, node: node.into() }
+        Self { bus, step, node: node.into(), namespace: Vec::new() }
+    }
+
+    pub fn with_namespace(mut self, ns: Vec<String>) -> Self {
+        self.namespace = ns;
+        self
+    }
+
+    /// Borrow the underlying bus (used by the subgraph adapter to forward
+    /// events to the parent run).
+    pub fn bus(&self) -> &StreamBus {
+        &self.bus
+    }
+
+    pub fn namespace(&self) -> &[String] {
+        &self.namespace
+    }
+
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    pub fn step(&self) -> u64 {
+        self.step
     }
 
     pub fn custom(&self, payload: Value) {
@@ -102,6 +247,7 @@ impl StreamWriter {
             step: self.step,
             node: self.node.clone(),
             payload,
+            namespace: self.namespace.clone(),
         });
     }
 
@@ -110,6 +256,56 @@ impl StreamWriter {
             step: self.step,
             node: self.node.clone(),
             message,
+            namespace: self.namespace.clone(),
+        });
+    }
+
+    pub fn chat_model_chunk(&self, chunk: Value) {
+        self.bus.publish(StreamEvent::OnChatModelStream {
+            step: self.step,
+            node: self.node.clone(),
+            chunk,
+            namespace: self.namespace.clone(),
+        });
+    }
+
+    pub fn tool_start(&self, tool: impl Into<String>, input: Value) {
+        self.bus.publish(StreamEvent::OnToolStart {
+            step: self.step,
+            node: self.node.clone(),
+            tool: tool.into(),
+            input,
+            namespace: self.namespace.clone(),
+        });
+    }
+
+    pub fn tool_end(&self, tool: impl Into<String>, output: Value) {
+        self.bus.publish(StreamEvent::OnToolEnd {
+            step: self.step,
+            node: self.node.clone(),
+            tool: tool.into(),
+            output,
+            namespace: self.namespace.clone(),
+        });
+    }
+
+    pub fn chain_start(&self, run_id: Option<String>, tags: Vec<String>) {
+        self.bus.publish(StreamEvent::OnChainStart {
+            step: self.step,
+            node: self.node.clone(),
+            run_id,
+            tags,
+            namespace: self.namespace.clone(),
+        });
+    }
+
+    pub fn chain_end(&self, run_id: Option<String>, output: Value) {
+        self.bus.publish(StreamEvent::OnChainEnd {
+            step: self.step,
+            node: self.node.clone(),
+            run_id,
+            output,
+            namespace: self.namespace.clone(),
         });
     }
 }
@@ -135,11 +331,16 @@ mod tests {
         let mut all = bus.subscribe(vec![]);
         let mut only_updates = bus.subscribe(vec![StreamMode::Updates]);
 
-        bus.publish(StreamEvent::Values { step: 1, values: BTreeMap::new() });
+        bus.publish(StreamEvent::Values {
+            step: 1,
+            values: BTreeMap::new(),
+            namespace: Vec::new(),
+        });
         bus.publish(StreamEvent::Updates {
             step: 1,
             node: "n".into(),
             update: BTreeMap::from([("x".into(), json!(1))]),
+            namespace: Vec::new(),
         });
 
         // all-mode subscriber should see two events

@@ -36,6 +36,10 @@ pub struct RunResult {
     pub values: BTreeMap<String, Value>,
     pub interrupted: Option<Interrupt>,
     pub steps: u64,
+    /// If the final step emitted a [`Command`] targeting the parent graph
+    /// (`Command.graph == Some("PARENT")`), it's surfaced here so the subgraph
+    /// adapter can forward it to the parent coordinator unchanged.
+    pub parent_command: Option<Command>,
 }
 
 /// Messages handled by the coordinator actor.
@@ -65,6 +69,12 @@ pub struct GraphCoordinator {
     pub stream_bus: Arc<StreamBus>,
     /// Optional checkpointer (boxed trait object set externally).
     pub checkpointer: Option<Arc<dyn CheckpointerHook>>,
+    /// Optional long-term store. When set, we install it into a task-local
+    /// around each node invocation so nodes can call
+    /// [`crate::context::get_store`] to access it.
+    pub store: Option<Arc<dyn crate::context::StoreAccessor>>,
+    /// Shared per-graph cache used by nodes with a `CachePolicy`.
+    pub cache: Option<Arc<crate::graph::NodeCache>>,
     state: RunState,
 }
 
@@ -81,6 +91,12 @@ struct RunState {
     reply: Option<oneshot::Sender<GraphResult<RunResult>>>,
     aborted: bool,
     interrupt: Option<Interrupt>,
+    /// If a node emitted a `Command { graph: Some("PARENT"), ... }`, we stash
+    /// it here and surface it in `RunResult.parent_command` at finish.
+    parent_command: Option<Command>,
+    /// Set of nodes to interrupt *after* their writes are applied (drained as
+    /// they fire so we only interrupt on the first hit).
+    interrupt_after_remaining: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +124,37 @@ pub trait CheckpointerHook: Send + Sync + 'static {
         &self,
         cfg: &RunnableConfig,
     ) -> GraphResult<Option<CheckpointReplay>>;
+
+    /// Persist per-task "pending writes" immediately after a node completes.
+    /// Upstream savers record these so an in-flight fan-out step can be
+    /// replayed on crash. Default: no-op (MemorySaver overrides it).
+    async fn put_writes(
+        &self,
+        _cfg: &RunnableConfig,
+        _task_id: &str,
+        _writes: &[(String, Value)],
+    ) -> GraphResult<()> {
+        Ok(())
+    }
+
+    /// Return a specific checkpoint by `checkpoint_id` (for time-travel).
+    /// Default: fall back to `get_latest` (suitable for in-memory savers that
+    /// store a chain but don't support per-id lookup directly).
+    async fn get_at(
+        &self,
+        cfg: &RunnableConfig,
+    ) -> GraphResult<Option<CheckpointReplay>> {
+        self.get_latest(cfg).await
+    }
+
+    /// List prior checkpoints for time-travel / history. Default: empty.
+    async fn list_checkpoints(
+        &self,
+        _cfg: &RunnableConfig,
+        _limit: Option<u32>,
+    ) -> GraphResult<Vec<CheckpointReplay>> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +170,24 @@ impl GraphCoordinator {
         stream_bus: Arc<StreamBus>,
         checkpointer: Option<Arc<dyn CheckpointerHook>>,
     ) -> Self {
-        Self { topology, stream_bus, checkpointer, state: RunState::default() }
+        Self {
+            topology,
+            stream_bus,
+            checkpointer,
+            store: None,
+            cache: None,
+            state: RunState::default(),
+        }
+    }
+
+    pub fn with_store(mut self, store: Option<Arc<dyn crate::context::StoreAccessor>>) -> Self {
+        self.store = store;
+        self
+    }
+
+    pub fn with_cache(mut self, cache: Option<Arc<crate::graph::NodeCache>>) -> Self {
+        self.cache = cache;
+        self
     }
 }
 
@@ -158,11 +222,17 @@ impl GraphCoordinator {
         // Fresh per-run state.
         let values = GraphValues::new(&self.topology.channel_specs);
 
-        // Replay from checkpoint if available.
+        // Replay from checkpoint if available. Use `get_at` when
+        // `cfg.checkpoint_id` is set so callers can time-travel.
         let mut start_step: u64 = 0;
         let mut prev_interrupt: Option<Interrupt> = None;
         if let Some(saver) = &self.checkpointer {
-            match saver.get_latest(&cfg).await {
+            let fetched = if cfg.checkpoint_id.is_some() {
+                saver.get_at(&cfg).await
+            } else {
+                saver.get_latest(&cfg).await
+            };
+            match fetched {
                 Ok(Some(rep)) => {
                     if let Err(e) = values.restore(rep.snapshot) {
                         let _ = reply.send(Err(e));
@@ -187,6 +257,8 @@ impl GraphCoordinator {
             }
         }
 
+        let interrupt_after_remaining: HashSet<String> =
+            self.topology.cfg.interrupt_after.iter().cloned().collect();
         self.state = RunState {
             values: Some(values),
             cfg,
@@ -197,6 +269,8 @@ impl GraphCoordinator {
             reply: Some(reply),
             aborted: false,
             interrupt: None,
+            parent_command: None,
+            interrupt_after_remaining,
         };
 
         // If we are resuming after an interrupt, route resume value to that node.
@@ -245,12 +319,57 @@ impl GraphCoordinator {
                 self.state.interrupt = Some(intr);
             }
             Ok(out) => {
+                // Persist per-task "pending writes" immediately (upstream
+                // durability guarantee so crashed fan-out can be replayed).
+                self.persist_pending_writes(&task_id, &out).await;
                 self.state.in_flight_writes.push((node.clone(), out));
             }
         }
         // When all dispatched nodes have responded, run Update phase.
         if self.state.pending.is_empty() {
             self.run_update_phase(ctx).await;
+        }
+    }
+
+    /// Forward a node's writes (`NodeOutput::Update` or `Command.update`) to
+    /// the checkpointer's per-task ledger, if one is attached.
+    async fn persist_pending_writes(&self, task_id: &str, out: &NodeOutput) {
+        let Some(saver) = &self.checkpointer else { return };
+        let writes: Vec<(String, Value)> = match out {
+            NodeOutput::Update(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            NodeOutput::Command(c) => {
+                c.update.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            }
+            _ => Vec::new(),
+        };
+        if writes.is_empty() {
+            return;
+        }
+        if let Err(e) = saver.put_writes(&self.state.cfg, task_id, &writes).await {
+            tracing::warn!(task_id, error = %e, "put_writes failed");
+        }
+    }
+
+    /// Write a checkpoint that only captures the current channel state +
+    /// pending interrupt (no per-node updates), used for static
+    /// `interrupt_before` breakpoints.
+    async fn persist_interrupt_checkpoint(&self) {
+        let Some(saver) = &self.checkpointer else { return };
+        let Some(values) = &self.state.values else { return };
+        let snap = values.snapshot();
+        let post_values = values.snapshot_values();
+        if let Err(e) = saver
+            .put_step(
+                &self.state.cfg,
+                self.state.step,
+                &post_values,
+                &snap,
+                &[],
+                self.state.interrupt.as_ref(),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "interrupt-before checkpoint failed");
         }
     }
 
@@ -263,19 +382,41 @@ impl GraphCoordinator {
             self.finish_run().await;
             return;
         }
-        let limit = self.state.cfg.effective_recursion_limit();
+        let limit = self.effective_recursion_limit();
         if self.state.step >= limit as u64 {
             if let Some(reply) = self.state.reply.take() {
                 let _ = reply.send(Err(GraphError::Recursion { limit }));
             }
             return;
         }
+
+        // Static breakpoint: `interrupt_before`. If any queued target is in
+        // the break-list, surface an Interrupt and pause the run *before* it
+        // executes. We pick the first match for payload stability.
+        if !self.topology.cfg.interrupt_before.is_empty() {
+            if let Some(hit) = self
+                .state
+                .next_targets
+                .iter()
+                .find(|t| self.topology.cfg.interrupt_before.iter().any(|n| n == &t.node))
+            {
+                let node = hit.node.clone();
+                self.state.interrupt = Some(Interrupt::new(
+                    node.clone(),
+                    serde_json::json!({"static": "before", "node": node}),
+                ));
+                // Persist the pause-state (restart will resume from here).
+                self.persist_interrupt_checkpoint().await;
+                self.finish_run().await;
+                return;
+            }
+        }
+
         self.state.step += 1;
         if let Some(values) = &self.state.values {
             values.begin_step();
         }
 
-        // Plan phase: take all currently-queued targets as the dispatch set.
         let targets: Vec<DispatchTarget> = self.state.next_targets.drain(..).collect();
         let values_map = self
             .state
@@ -315,10 +456,55 @@ impl GraphCoordinator {
                 self.state.step,
                 node_name.clone(),
             );
+            let retry = self.topology.retries.get(&node_name).cloned();
+            let cache_policy = self.topology.caches.get(&node_name).cloned();
+            let cache = self.cache.clone();
+            // astream_events v2: emit on_chain_start before dispatch.
+            self.stream_bus.publish(StreamEvent::OnChainStart {
+                step: self.state.step,
+                node: node_name.clone(),
+                run_id: self.state.cfg.run_id.clone(),
+                tags: self.state.cfg.tags.clone(),
+                namespace: Vec::new(),
+            });
+            let store = self.store.clone();
             tokio::spawn(async move {
-                let result = crate::stream::CURRENT_WRITER
-                    .scope(writer, node_kind.invoke(input))
-                    .await;
+                // Cache read (if policy attached + entry fresh).
+                if let (Some(pol), Some(cache)) = (cache_policy.as_ref(), cache.as_ref()) {
+                    let key = (pol.key_func)(&input);
+                    let now = std::time::Instant::now();
+                    let hit = {
+                        let g = cache.read();
+                        g.get(&(node_name.clone(), key.clone())).and_then(|e| {
+                            match e.expires_at {
+                                Some(exp) if exp <= now => None,
+                                _ => Some(e.value.clone()),
+                            }
+                        })
+                    };
+                    if let Some(values) = hit {
+                        let result = Ok(NodeOutput::Update(values));
+                        self_ref.tell(CoordMsg::NodeDone { task_id, node: node_name, result });
+                        return;
+                    }
+                    let result =
+                        invoke_with_retry(node_kind, input.clone(), writer, retry, store).await;
+                    // Cache successful `Update` outputs only (not Command /
+                    // Send / Interrupt, which carry control-flow state).
+                    if let Ok(NodeOutput::Update(ref values)) = result {
+                        let expires_at = pol
+                            .ttl_seconds
+                            .map(|s| now + std::time::Duration::from_secs(s));
+                        cache.write().insert(
+                            (node_name.clone(), key),
+                            crate::graph::CacheEntry { value: values.clone(), expires_at },
+                        );
+                    }
+                    self_ref.tell(CoordMsg::NodeDone { task_id, node: node_name, result });
+                    return;
+                }
+                let result =
+                    invoke_with_retry(node_kind, input, writer, retry, store).await;
                 self_ref.tell(CoordMsg::NodeDone { task_id, node: node_name, result });
             });
         }
@@ -331,6 +517,18 @@ impl GraphCoordinator {
             // Dispatched only END (or no-ops); finish.
             self.finish_run().await;
         }
+    }
+
+    /// Fold `cfg.recursion_limit`, `topology.cfg.recursion_limit`, and the
+    /// upstream default (25) in that precedence order.
+    fn effective_recursion_limit(&self) -> u32 {
+        if let Some(n) = self.state.cfg.recursion_limit {
+            return n;
+        }
+        if let Some(n) = self.topology.cfg.recursion_limit {
+            return n;
+        }
+        25
     }
 
     /// Aggregate node outputs, emit stream events, persist a checkpoint,
@@ -393,15 +591,38 @@ impl GraphCoordinator {
                 step: self.state.step,
                 node: node.clone(),
                 update: update.clone(),
+                namespace: Vec::new(),
+            });
+            // astream_events v2: emit synthetic on_chain_end pairs for
+            // observers that only want fine-grained events.
+            self.stream_bus.publish(StreamEvent::OnChainEnd {
+                step: self.state.step,
+                node: node.clone(),
+                run_id: self.state.cfg.run_id.clone(),
+                output: serde_json::to_value(update).unwrap_or(Value::Null),
+                namespace: Vec::new(),
             });
         }
         self.stream_bus.publish(StreamEvent::Values {
             step: self.state.step,
             values: post_values.clone(),
+            namespace: Vec::new(),
         });
 
         // Now route — conditional routers see post-update state.
+        let mut hit_interrupt_after: Option<String> = None;
         for (node, cmd, _update) in &commands_by_node {
+            // Command targeting parent graph (`Command(graph="PARENT")`) does
+            // NOT route within this graph; we stash it for the subgraph
+            // adapter to propagate upward at finish.
+            if let Some(c) = cmd {
+                if c.graph.as_deref() == Some("PARENT") {
+                    let mut escape = c.clone();
+                    escape.graph = None; // consumed
+                    self.state.parent_command = Some(escape);
+                    continue;
+                }
+            }
             // Command-driven explicit goto first.
             let nexts = self.topology.next_targets(node, cmd.as_ref(), &post_values);
             for n in nexts {
@@ -419,31 +640,64 @@ impl GraphCoordinator {
                     });
                 }
             }
+
+            // Static breakpoint: `interrupt_after`. Trigger after the writes
+            // have been applied so the caller can inspect the post-update
+            // values via `get_state`.
+            if hit_interrupt_after.is_none()
+                && self.state.interrupt_after_remaining.contains(node)
+            {
+                hit_interrupt_after = Some(node.clone());
+            }
+        }
+        if let Some(node) = hit_interrupt_after {
+            self.state.interrupt_after_remaining.remove(&node);
+            self.state.interrupt = Some(Interrupt::new(
+                node.clone(),
+                serde_json::json!({"static": "after", "node": node}),
+            ));
         }
 
-        // Persist checkpoint (best-effort; failure aborts run).
-        if let Some(saver) = &self.checkpointer {
-            let snap = values.snapshot();
-            if let Err(e) = saver
-                .put_step(
-                    &self.state.cfg,
-                    self.state.step,
-                    &post_values,
-                    &snap,
-                    &per_node_updates,
-                    self.state.interrupt.as_ref(),
-                )
-                .await
-            {
-                self.state.aborted = true;
-                if let Some(reply) = self.state.reply.take() {
-                    let _ = reply.send(Err(e));
+        // Persist checkpoint. `Durability::Exit` defers writes to finish_run.
+        if !matches!(self.topology.cfg.durability, crate::graph::Durability::Exit) {
+            if let Some(saver) = &self.checkpointer {
+                let snap = values.snapshot();
+                let cfg = self.state.cfg.clone();
+                let step = self.state.step;
+                let updates = per_node_updates.clone();
+                let intr = self.state.interrupt.clone();
+                let post = post_values.clone();
+                let saver = saver.clone();
+                let snap_for_sync = snap.clone();
+                match self.topology.cfg.durability {
+                    crate::graph::Durability::Sync => {
+                        if let Err(e) = saver
+                            .put_step(&cfg, step, &post, &snap_for_sync, &updates, intr.as_ref())
+                            .await
+                        {
+                            self.state.aborted = true;
+                            if let Some(reply) = self.state.reply.take() {
+                                let _ = reply.send(Err(e));
+                            }
+                            return;
+                        }
+                    }
+                    crate::graph::Durability::Async => {
+                        tokio::spawn(async move {
+                            if let Err(e) = saver
+                                .put_step(&cfg, step, &post, &snap, &updates, intr.as_ref())
+                                .await
+                            {
+                                tracing::warn!(error = %e, "async checkpoint failed");
+                            }
+                        });
+                    }
+                    crate::graph::Durability::Exit => {}
                 }
-                return;
             }
         }
 
-        // If a node interrupted, surface immediately and pause.
+        // If a node interrupted (user or static), surface immediately.
         if self.state.interrupt.is_some() {
             self.finish_run().await;
             return;
@@ -454,6 +708,28 @@ impl GraphCoordinator {
     }
 
     async fn finish_run(&mut self) {
+        // `Durability::Exit`: persist the final snapshot once on the way out.
+        if matches!(self.topology.cfg.durability, crate::graph::Durability::Exit) {
+            if let (Some(saver), Some(values)) =
+                (&self.checkpointer, self.state.values.as_ref())
+            {
+                let snap = values.snapshot();
+                let post_values = values.snapshot_values();
+                if let Err(e) = saver
+                    .put_step(
+                        &self.state.cfg,
+                        self.state.step,
+                        &post_values,
+                        &snap,
+                        &[],
+                        self.state.interrupt.as_ref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "exit-durability checkpoint failed");
+                }
+            }
+        }
         let values = self
             .state
             .values
@@ -461,7 +737,13 @@ impl GraphCoordinator {
             .map(|v| v.snapshot_values())
             .unwrap_or_default();
         let interrupted = self.state.interrupt.take();
-        let result = RunResult { values, interrupted, steps: self.state.step };
+        let parent_command = self.state.parent_command.take();
+        let result = RunResult {
+            values,
+            interrupted,
+            steps: self.state.step,
+            parent_command,
+        };
         if let Some(reply) = self.state.reply.take() {
             let _ = reply.send(Ok(result));
         }
@@ -472,6 +754,7 @@ impl GraphCoordinator {
             self.stream_bus.publish(StreamEvent::Debug {
                 step: self.state.step,
                 payload: serde_json::Value::String(msg),
+                namespace: Vec::new(),
             });
         }
     }
@@ -483,6 +766,57 @@ fn clone_node(n: &NodeKind) -> NodeKind {
         NodeKind::Python(p) => NodeKind::Python(p.clone()),
         NodeKind::Subgraph(s) => NodeKind::Subgraph(s.clone()),
     }
+}
+
+/// Invoke a node honoring its optional [`RetryPolicy`]. The task-local
+/// `StreamWriter` and (optionally) `CURRENT_STORE` are installed once and
+/// re-used across retries so any streamed chunks / store operations from
+/// partial attempts remain correctly attributed.
+async fn invoke_with_retry(
+    node_kind: NodeKind,
+    input: BTreeMap<String, Value>,
+    writer: crate::stream::StreamWriter,
+    retry: Option<crate::graph::RetryPolicy>,
+    store: Option<Arc<dyn crate::context::StoreAccessor>>,
+) -> GraphResult<NodeOutput> {
+    let attempts = retry
+        .as_ref()
+        .map(|r| r.max_attempts.max(1))
+        .unwrap_or(1);
+    let backoff_ms = retry.as_ref().map(|r| r.backoff_ms).unwrap_or(0);
+    let mut last_err: Option<GraphError> = None;
+    for attempt in 0..attempts {
+        let input_i = input.clone();
+        let node = clone_node_kind(&node_kind);
+        let writer_i = writer.clone();
+        let store_i = store.clone();
+        let res = crate::stream::CURRENT_WRITER
+            .scope(writer_i, async move {
+                match store_i {
+                    Some(s) => {
+                        crate::context::CURRENT_STORE
+                            .scope(s, async move { node.invoke(input_i).await })
+                            .await
+                    }
+                    None => node.invoke(input_i).await,
+                }
+            })
+            .await;
+        match res {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < attempts && backoff_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| GraphError::other("retry policy exhausted with no error")))
+}
+
+fn clone_node_kind(n: &NodeKind) -> NodeKind {
+    clone_node(n)
 }
 
 // suppress unused warnings on optional helpers

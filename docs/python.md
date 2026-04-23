@@ -27,16 +27,17 @@ you can keep the dev loop fast after Rust-side edits.
 
 | Upstream import | Supported | Notes |
 | --- | --- | --- |
-| `from langgraph.graph import StateGraph, START, END, CompiledStateGraph` | ✅ | |
+| `from langgraph.graph import StateGraph, START, END, CompiledStateGraph` | ✅ | Exposes `invoke`, `ainvoke`, `stream`, `astream`, `with_config`, `get_state`, `get_state_history`, `update_state`, `draw_mermaid`, `draw_ascii`, `resume`. |
 | `from langgraph import MemorySaver` | ✅ | Also exported under `langgraph.checkpoint.memory`. |
 | `from langgraph.checkpoint.sqlite import SqliteSaver` | ✅ | Requires the cdylib to be built with the `sqlite` feature (on by default). |
 | `from langgraph.checkpoint.postgres import PostgresSaver, AsyncPostgresSaver` | ✅ | Requires `postgres` feature. |
-| `from langgraph.store.memory import InMemoryStore` | ✅ | TTL + search + `list_namespaces`. |
+| `from langgraph.store.memory import InMemoryStore` | ✅ | TTL + (optional) embedder-backed semantic search + `list_namespaces`. |
 | `from langgraph.store.postgres import PostgresStore, AsyncPostgresStore` | ✅ | Requires `postgres` feature. |
-| `from langgraph.types import Command, Send, Interrupt, interrupt` | ✅ | |
+| `from langgraph.types import Command, Send, Interrupt, interrupt` | ✅ | `Command(graph="PARENT", ...)` escalates from a subgraph. |
 | `from langgraph.prebuilt import create_react_agent, ToolNode, tools_condition` | ✅ | Pure-Python wrappers that emit a native graph. |
+| `from langgraph_supervisor import create_supervisor` / `langgraph_swarm import create_swarm` | ✅ | Thin wrappers over the Rust `create_supervisor` / `create_swarm` factories. |
 | `from langgraph.func import entrypoint, task` | ✅ | `@entrypoint(checkpointer=..)` compiles a single-node graph. |
-| `from langgraph.config import get_store, get_stream_writer` | 🚧 | Planned — surface `CURRENT_WRITER` / store handle as task-locals. |
+| `from langgraph.config import get_store, get_stream_writer` | 🚧 | Planned — surface `CURRENT_WRITER` / store handle as task-locals. Store is already reachable from *Rust* nodes via `rustakka_langgraph_core::context::get_store`. |
 
 ## `StateGraph` API
 
@@ -67,8 +68,14 @@ for event in app.stream({}, stream_mode="values"):
 Supported compile kwargs:
 
 - `checkpointer` — `MemorySaver`, `SqliteSaver`, `PostgresSaver`.
-- `store` — any store exposed to `CompiledStateGraph`; attached to the
-  compiled handle.
+- `store` — `InMemoryStore` or `PostgresStore`; the compiled graph
+  threads a `StoreAccessor` into every run so nodes can reach it.
+- `interrupt_before` / `interrupt_after` — static breakpoint node
+  names (single string or list). Mirrors upstream's HITL pattern.
+- `recursion_limit` — compile-time ceiling on supersteps. Overridable
+  per-run via `config["recursion_limit"]`.
+- `durability` — `"sync"` (default), `"async"`, or `"exit"`. See
+  [checkpointing.md](checkpointing.md#durability-modes).
 - `debug` — flips the coordinator into debug mode (emits
   `StreamEvent::Debug`).
 
@@ -76,8 +83,44 @@ Runtime `config` mirrors upstream:
 
 ```python
 {"configurable": {"thread_id": "t1", "checkpoint_ns": "demo"},
- "recursion_limit": 25}
+ "recursion_limit": 25,
+ "checkpoint_id": "optional-for-time-travel"}
 ```
+
+### Time-travel and manual state edits
+
+When a checkpointer is attached, `CompiledStateGraph` exposes the full
+upstream inspection API:
+
+```python
+cfg = {"configurable": {"thread_id": "t1"}}
+app.invoke({"count": 0}, cfg)
+
+snap   = app.get_state(cfg)                 # latest snapshot
+hist   = app.get_state_history(cfg, 10)     # newest first, up to 10 entries
+app.update_state(cfg, {"count": 42})        # patch without running a node
+app.with_config({"recursion_limit": 5})     # new handle w/ merged defaults
+```
+
+`snap` is a dict with `values`, `step`, `interrupt`, and `config`.
+Setting `config["checkpoint_id"]` on any call rehydrates that specific
+snapshot.
+
+### Attaching a store
+
+```python
+from langgraph.store.memory import InMemoryStore
+
+store = InMemoryStore()
+app   = g.compile(checkpointer=MemorySaver(), store=store)
+app.invoke({"user_id": "alice"}, cfg)
+```
+
+Python nodes currently access the store via the wrapper object they
+already hold; Rust nodes use
+`rustakka_langgraph_core::context::get_store()` to reach the same
+instance. See [store.md](store.md) for `with_embedder(...)` and
+semantic search usage.
 
 ## Conditional routing
 
@@ -114,7 +157,19 @@ print(app.invoke({"messages": [{"role": "user", "content": "40+2?"}]}))
 ```
 
 `ToolNode` and `tools_condition` are also importable directly if you
-want to wire the graph yourself.
+want to wire the graph yourself. See [prebuilt.md](prebuilt.md) for the
+`create_supervisor` / `create_swarm` multi-agent factories.
+
+## Graph visualization
+
+```python
+print(app.draw_mermaid())   # Mermaid `flowchart TD` for notebooks / docs
+print(app.draw_ascii())     # minimal text overview for logs
+```
+
+Mirrors upstream's `get_graph().draw_mermaid()` / `draw_ascii()`;
+conditional edges are shown as dotted arrows with their branch labels
+(when a `path_map` was supplied).
 
 ## Functional API
 

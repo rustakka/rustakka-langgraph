@@ -1,28 +1,38 @@
 # Streaming
 
 `rustakka-langgraph` supports every streaming mode the upstream Python
-LangGraph ships: `values`, `updates`, `messages`, `custom`, and
-`debug`. The underlying transport is a typed broadcast bus inside the
-coordinator that fans events out to any number of subscribers without
-slowing the Pregel barrier.
+LangGraph ships — `values`, `updates`, `messages`, `custom`, `debug`,
+plus the newer `events` mode that powers `astream_events()` v2. The
+underlying transport is a typed broadcast bus inside the coordinator
+that fans events out to any number of subscribers without slowing the
+Pregel barrier. Events from subgraphs carry a `namespace: Vec<String>`
+so callers can distinguish nested graphs when `subgraphs=True`.
 
 ## Event model
 
 ```rust
 // crates/rustakka-langgraph-core/src/stream.rs
 pub enum StreamEvent {
-    Values   { step: u32, values: BTreeMap<String, Value> },
-    Updates  { step: u32, node: String, update: BTreeMap<String, Value> },
-    Messages { step: u32, node: String, message: Value },
-    Custom   { step: u32, node: String, payload: Value },
-    Debug    { step: u32, payload: Value },
+    Values   { step: u64, values: BTreeMap<String, Value>, namespace: Vec<String> },
+    Updates  { step: u64, node: String, update: BTreeMap<String, Value>, namespace: Vec<String> },
+    Messages { step: u64, node: String, message: Value, namespace: Vec<String> },
+    Custom   { step: u64, node: String, payload: Value, namespace: Vec<String> },
+    Debug    { step: u64, payload: Value, namespace: Vec<String> },
+
+    // astream_events v2 ------------------------------------------
+    OnChainStart      { step: u64, node: String, run_id: Option<String>, tags: Vec<String>, namespace: Vec<String> },
+    OnChainEnd        { step: u64, node: String, run_id: Option<String>, output: Value, namespace: Vec<String> },
+    OnChatModelStream { step: u64, node: String, chunk: Value, namespace: Vec<String> },
+    OnToolStart       { step: u64, node: String, tool: String, input: Value, namespace: Vec<String> },
+    OnToolEnd         { step: u64, node: String, tool: String, output: Value, namespace: Vec<String> },
 }
 
-pub enum StreamMode { Values, Updates, Messages, Custom, Debug }
+pub enum StreamMode { Values, Updates, Messages, Custom, Debug, Events }
 ```
 
 `StreamBus::subscribe(modes)` returns a `tokio::sync::mpsc::Receiver`;
-passing an empty `modes` vector subscribes to everything.
+passing an empty `modes` vector subscribes to everything. All
+`astream_events` v2 variants live under `StreamMode::Events`.
 
 ## When each event fires
 
@@ -33,6 +43,9 @@ passing an empty `modes` vector subscribes to everything.
 | `Messages` | Execute phase | When a node calls `current_writer().message(..)`. |
 | `Custom` | Execute phase | When a node calls `current_writer().custom(..)`. |
 | `Debug` | Plan / Update | When `CompileConfig { debug: true, .. }`; payload shape is intentionally unstable. |
+| `OnChainStart` / `OnChainEnd` | Execute / Update | Immediately before dispatch and after a node's writes are merged. |
+| `OnChatModelStream` | Execute | When a node calls `current_writer().chat_model_chunk(..)`. |
+| `OnToolStart` / `OnToolEnd` | Execute | `ToolNode` (and user code) emits these around each tool invocation. |
 
 ## Emitting from a node (Rust)
 
@@ -48,6 +61,10 @@ let node = NodeKind::from_fn(|_| async move {
     if let Some(w) = current_writer() {
         w.custom(json!({"progress": 0.25}));
         w.message(json!({"role": "assistant", "content": "thinking…"}));
+        // astream_events v2 helpers
+        w.chat_model_chunk(json!({"content": "hi"}));
+        w.tool_start("calc", json!({"a": 1, "b": 2}));
+        w.tool_end("calc", json!(3));
     }
     Ok(NodeOutput::Update(Default::default()))
 });
@@ -92,18 +109,46 @@ events.
 
 ```python
 for event in app.stream({"name": "alice"}, stream_mode=["values", "updates"]):
-    kind = event["kind"]
-    if kind == "values":
-        print("snapshot", event["step"], event["values"])
-    elif kind == "updates":
-        print("update from", event["node"], event["update"])
+    mode, payload = event  # multi-mode subscribers always receive (mode, event)
+    if mode == "values":
+        print("snapshot", payload["step"], payload["values"])
+    elif mode == "updates":
+        print("update from", payload["node"], payload["update"])
 ```
 
 Accepted `stream_mode` values mirror upstream: a single string, a list
-of strings, or `None` for *all*.
+of strings, or `None` for *all*. The shape of each yielded element
+depends on which options are set:
+
+| `stream_mode` | `subgraphs` | Yield shape |
+| --- | --- | --- |
+| single | `False` (default) | bare event dict |
+| list | `False` | `(mode, event)` |
+| single | `True` | `(namespace_tuple, event)` |
+| list | `True` | `(namespace_tuple, mode, event)` |
+
+Subscribing to `events` returns the v2 kinds — each payload carries an
+`event` field (`"on_chain_start"`, `"on_tool_end"`, …) plus the fields
+enumerated in the event model table.
 
 The sync `stream()` iterator collects events in order; `astream()`
 yields them as an `AsyncIterator`.
+
+## Subgraph namespacing
+
+When a subgraph runs as a node inside a parent graph, its stream events
+are forwarded onto the parent bus with the subgraph node name prepended
+to their `namespace`:
+
+```python
+for ns, mode, event in app.stream({}, stream_mode=["updates"], subgraphs=True):
+    # ns == ("planner",) for events emitted inside the `planner` subgraph
+    # ns == ()            for events emitted by the root graph
+    ...
+```
+
+This lets a single subscriber observe the full nested trace without
+juggling multiple buses.
 
 ## Debug mode
 
