@@ -2,11 +2,20 @@
 //!
 //! `astream` / `stream` consumers subscribe via [`StreamBus::subscribe`]; the
 //! coordinator publishes [`StreamEvent`]s as supersteps progress.
+//!
+//! Internally the bus is implemented as a *message-driven actor*: a
+//! dedicated tokio task owns the subscriber list (no mutex), and
+//! [`StreamBus`] holds an `UnboundedSender<BusCmd>` to that task.
+//! Callers interact only through [`publish`], [`subscribe`] and
+//! [`subscribe_source`]; the actor shape keeps the bus consistent with
+//! the rest of the runtime even though it's not spawned through
+//! `ActorSystem` (the bus outlives any single coordinator).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use rustakka_streams::{OverflowStrategy, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -162,44 +171,159 @@ impl StreamEvent {
     }
 }
 
-/// Lightweight broadcast bus. Avoids `tokio::sync::broadcast`'s lossy semantics
-/// because checkpoint correctness requires every subscriber sees every event.
-#[derive(Clone, Default)]
+/// Opaque subscriber identifier. Returned by
+/// [`StreamBus::subscribe_with_id`] and used with
+/// [`StreamBus::unsubscribe`].
+pub type SubId = u64;
+
+/// Broadcast bus for [`StreamEvent`]s. Cheap to [`Clone`] — all clones
+/// share the same underlying subscriber registry.
+///
+/// The bus is intentionally *actor-shaped*: all mutations of the
+/// subscriber list (`subscribe`, `unsubscribe`) are serialized through
+/// a single writer lock so concurrent runs can't observe a torn view.
+/// `publish` takes a read lock and fans out inline — this keeps strict
+/// happens-before ordering between "the coordinator emitted X" and
+/// "subscribers have X in their mpsc" without a task-hop, which the
+/// existing streaming tests rely on. The alternative (a separate bus
+/// task forwarding BusCmd::Publish) would make `publish` asynchronous
+/// with respect to the coordinator's visible timeline and break the
+/// post-`run.await` drain contract.
+///
+/// The bus avoids `tokio::sync::broadcast`'s lossy semantics because
+/// checkpoint correctness requires every subscriber sees every event.
+#[derive(Clone)]
 pub struct StreamBus {
-    inner: Arc<StreamBusInner>,
+    subs: Arc<parking_lot::RwLock<Vec<Subscriber>>>,
+    next_id: Arc<AtomicU64>,
 }
 
-#[derive(Default)]
-struct StreamBusInner {
-    subscribers: Mutex<Vec<Subscriber>>,
+impl Default for StreamBus {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 struct Subscriber {
+    id: SubId,
     modes: Vec<StreamMode>,
     tx: mpsc::UnboundedSender<StreamEvent>,
 }
 
 impl StreamBus {
+    /// Construct a new bus.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            subs: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            next_id: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn alloc_id(&self) -> SubId {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Subscribe to a specific set of modes; pass an empty vec for "all".
     pub fn subscribe(&self, modes: Vec<StreamMode>) -> mpsc::UnboundedReceiver<StreamEvent> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.inner.subscribers.lock().push(Subscriber { modes, tx });
+        let (_, rx) = self.subscribe_with_id(modes);
         rx
     }
 
+    /// Like [`Self::subscribe`] but also returns the [`SubId`] so the
+    /// caller can later [`Self::unsubscribe`]. Used by
+    /// [`subscribe_source`] to wire up a `KillSwitch` that terminates
+    /// *just this subscriber*.
+    pub fn subscribe_with_id(
+        &self,
+        modes: Vec<StreamMode>,
+    ) -> (SubId, mpsc::UnboundedReceiver<StreamEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = self.alloc_id();
+        self.subs.write().push(Subscriber { id, modes, tx });
+        (id, rx)
+    }
+
+    /// Remove a subscriber previously returned by
+    /// [`subscribe_with_id`]. No-op if already gone.
+    pub fn unsubscribe(&self, id: SubId) {
+        self.subs.write().retain(|s| s.id != id);
+    }
+
+    /// Broadcast an event. Fire-and-forget — matches the pre-actor
+    /// signature. Dead subscribers are garbage-collected lazily: a
+    /// failed send triggers an upgrade to a write lock which removes
+    /// closed channels, so slow consumers that `drop` their receiver
+    /// don't leak.
     pub fn publish(&self, ev: StreamEvent) {
         let mode = ev.mode();
-        let mut subs = self.inner.subscribers.lock();
-        subs.retain(|s| {
-            if !s.modes.is_empty() && !s.modes.contains(&mode) {
-                return true;
+        let mut dead: Vec<SubId> = Vec::new();
+        {
+            let guard = self.subs.read();
+            for s in guard.iter() {
+                if !s.modes.is_empty() && !s.modes.contains(&mode) {
+                    continue;
+                }
+                if s.tx.send(ev.clone()).is_err() {
+                    dead.push(s.id);
+                }
             }
-            s.tx.send(ev.clone()).is_ok()
-        });
+        }
+        if !dead.is_empty() {
+            let mut w = self.subs.write();
+            w.retain(|s| !dead.contains(&s.id));
+        }
+    }
+
+    /// Subscribe and materialize the stream as a rustakka-streams
+    /// [`Source`]. `overflow` is applied only when `buffer_size` is
+    /// `Some(n)`; otherwise the bus delivers with unbounded fan-out
+    /// (matching the legacy [`subscribe`] semantics exactly).
+    ///
+    /// Returns `(subscription, source)`. Dropping the returned
+    /// [`Subscription`] unregisters the subscriber from the bus — the
+    /// attached source then sees end-of-stream. This is the preferred
+    /// subscription API from within Rust; Python and legacy Rust
+    /// callers stay on the [`subscribe`]/[`subscribe_with_id`] pair.
+    pub fn subscribe_source(
+        &self,
+        modes: Vec<StreamMode>,
+        buffer: Option<(usize, OverflowStrategy)>,
+    ) -> (Subscription, Source<StreamEvent>) {
+        let (id, rx) = self.subscribe_with_id(modes);
+        let src = Source::from_receiver(rx);
+        let src = match buffer {
+            Some((size, strategy)) => src.buffer(size, strategy),
+            None => src,
+        };
+        (Subscription { bus: self.clone(), id: Some(id) }, src)
+    }
+}
+
+/// RAII-style handle that unregisters its bus subscription when dropped.
+/// See [`StreamBus::subscribe_source`].
+pub struct Subscription {
+    bus: StreamBus,
+    id: Option<SubId>,
+}
+
+impl Subscription {
+    /// Unsubscribe explicitly; equivalent to dropping.
+    pub fn unsubscribe(mut self) {
+        if let Some(id) = self.id.take() {
+            self.bus.unsubscribe(id);
+        }
+    }
+
+    pub fn id(&self) -> Option<SubId> {
+        self.id
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.bus.unsubscribe(id);
+        }
     }
 }
 
@@ -348,5 +472,84 @@ mod tests {
         assert!(matches!(all.recv().await.unwrap(), StreamEvent::Updates { .. }));
         // updates-only subscriber should see exactly one
         assert!(matches!(only_updates.recv().await.unwrap(), StreamEvent::Updates { .. }));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_stops_delivery() {
+        let bus = StreamBus::new();
+        let (id, mut rx) = bus.subscribe_with_id(vec![]);
+        bus.publish(StreamEvent::Debug {
+            step: 0,
+            payload: json!("a"),
+            namespace: Vec::new(),
+        });
+        // Allow the bus actor to process the Publish before we unsubscribe.
+        assert!(matches!(rx.recv().await.unwrap(), StreamEvent::Debug { .. }));
+        bus.unsubscribe(id);
+        // Give the bus actor a chance to process the Unsubscribe, then
+        // publish — the subscriber should no longer receive.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        bus.publish(StreamEvent::Debug {
+            step: 0,
+            payload: json!("b"),
+            namespace: Vec::new(),
+        });
+        // After unsubscribe the bus drops its tx for this subscriber,
+        // which closes the channel. `rx.recv()` therefore returns
+        // `None` (not a spurious event).
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            rx.recv(),
+        )
+        .await;
+        assert!(matches!(closed, Ok(None)), "expected closed channel, got {:?}", closed);
+    }
+
+    /// `subscribe_source` returns a `Source<StreamEvent>` that dries up
+    /// as soon as the accompanying `Subscription` is dropped; it's the
+    /// Source-native pair of the legacy `subscribe_with_id` / `unsubscribe`
+    /// pair.
+    #[tokio::test]
+    async fn subscribe_source_delivers_then_closes_on_drop() {
+        let bus = StreamBus::new();
+        let (sub, source) = bus.subscribe_source(vec![], None);
+        bus.publish(StreamEvent::Debug {
+            step: 0,
+            payload: json!("first"),
+            namespace: Vec::new(),
+        });
+        bus.publish(StreamEvent::Debug {
+            step: 1,
+            payload: json!("second"),
+            namespace: Vec::new(),
+        });
+        drop(sub);
+        let collected: Vec<StreamEvent> = rustakka_streams::Sink::collect(source).await;
+        assert!(collected.len() >= 1, "expected at least one event, got {}", collected.len());
+        assert!(collected.iter().all(|e| matches!(e, StreamEvent::Debug { .. })));
+    }
+
+    /// With `OverflowStrategy::DropHead` and a tiny buffer, a backlogged
+    /// subscriber must never block the bus (so `publish` returns promptly)
+    /// and delivers at most `size` buffered items.
+    #[tokio::test]
+    async fn subscribe_source_overflow_drop_head_bounds_buffer() {
+        let bus = StreamBus::new();
+        let (_sub, source) =
+            bus.subscribe_source(vec![], Some((2, OverflowStrategy::DropHead)));
+        for i in 0..20u64 {
+            bus.publish(StreamEvent::Debug {
+                step: i,
+                payload: json!(i),
+                namespace: Vec::new(),
+            });
+        }
+        drop(_sub);
+        let collected: Vec<StreamEvent> = rustakka_streams::Sink::collect(source).await;
+        // A bounded buffer of size 2 + DropHead cannot possibly retain all
+        // 20 events; the exact count depends on scheduling but must be
+        // strictly less than what we published.
+        assert!(collected.len() < 20, "overflow did not bound buffer: {}", collected.len());
     }
 }

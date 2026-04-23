@@ -41,7 +41,7 @@ pub mod mock;
 pub mod prelude {
     //! Common imports for provider consumers.
     pub use crate::error::ProviderError;
-    pub use crate::traits::ChatModel;
+    pub use crate::traits::{chat_model_stream_source, ChatModel};
     pub use crate::types::message::{ContentBlock, Message, Role, ToolCallRequest};
     pub use crate::types::options::{CallOptions, GenerationChunk, ToolCallChunkDelta, ToolDefinition};
 

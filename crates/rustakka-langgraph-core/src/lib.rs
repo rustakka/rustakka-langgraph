@@ -30,6 +30,7 @@ pub mod coordinator;
 pub mod errors;
 pub mod graph;
 pub mod node;
+pub mod node_worker;
 pub mod runner;
 pub mod state;
 pub mod stream;

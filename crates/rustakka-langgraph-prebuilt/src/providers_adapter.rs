@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use futures::StreamExt;
 use serde_json::{json, Value};
 
 use rustakka_langgraph_core::errors::{GraphError, GraphResult};
@@ -73,7 +72,9 @@ pub fn chat_model_fn(
                         node: "agent".into(),
                         source: anyhow::anyhow!(e.to_string()),
                     })?,
-                InvocationMode::Stream => stream_into_message(model.as_ref(), &msgs, &opts).await?,
+                InvocationMode::Stream => {
+                    stream_into_message(model.clone(), msgs.clone(), opts.clone()).await?
+                }
             };
 
             Ok(message_to_json(&reply))
@@ -86,34 +87,40 @@ pub fn chat_model_fn(
 // ---------------------------------------------------------------------------
 
 async fn stream_into_message(
-    model: &dyn ChatModel,
-    msgs: &[Message],
-    opts: &CallOptions,
+    model: Arc<dyn ChatModel>,
+    msgs: Vec<Message>,
+    opts: CallOptions,
 ) -> GraphResult<Message> {
     let writer = current_writer();
-    let mut stream = model.stream(msgs, opts).await.map_err(|e| GraphError::Node {
-        node: "agent".into(),
-        source: anyhow::anyhow!(e.to_string()),
-    })?;
+    // Express the chunk stream as a rustakka-streams Source: side-effect
+    // publishing happens through `wire_tap` (one `chat_model_chunk`
+    // StreamEvent per successful chunk), and the final `Message` is
+    // assembled by running the source through a `Sink::collect`. This
+    // replaces the hand-rolled `while let Some(..) = stream.next()`
+    // loop while preserving the public behavior.
+    let writer_tap = writer.clone();
+    let source = chat_model_stream_source(model, msgs, opts).wire_tap(move |chunk| {
+        if let (Some(w), Ok(c)) = (writer_tap.as_ref(), chunk.as_ref()) {
+            let payload = json!({
+                "text": c.text,
+                "tool_call_chunks": c.tool_call_chunks,
+                "metadata": c.metadata,
+            });
+            w.chat_model_chunk(payload);
+        }
+    });
+    let chunks: Vec<Result<GenerationChunk, ProviderError>> =
+        rustakka_streams::Sink::collect(source).await;
 
     let mut text = String::new();
     // Keyed by chunk.index, holds (id, name, arguments buffer).
     let mut tool_buffers: BTreeMap<usize, PartialTool> = BTreeMap::new();
 
-    while let Some(chunk_res) = stream.next().await {
+    for chunk_res in chunks {
         let chunk = chunk_res.map_err(|e| GraphError::Node {
             node: "agent".into(),
             source: anyhow::anyhow!(e.to_string()),
         })?;
-
-        if let Some(w) = &writer {
-            let payload = json!({
-                "text": chunk.text,
-                "tool_call_chunks": chunk.tool_call_chunks,
-                "metadata": chunk.metadata,
-            });
-            w.message(payload);
-        }
 
         if !chunk.text.is_empty() {
             text.push_str(&chunk.text);

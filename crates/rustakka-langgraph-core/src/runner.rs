@@ -6,12 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use once_cell::sync::OnceCell;
 use rustakka_config::Config;
 use rustakka_core::actor::{ActorSystem, Props};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::config::{RunnableConfig, StreamMode};
 use crate::coordinator::{CheckpointerHook, CoordMsg, GraphCoordinator, RunResult};
@@ -201,6 +202,57 @@ pub fn stream(
     (rx, h)
 }
 
+/// Additive rustakka-streams entry point. Like [`stream`] but exposes
+/// events as a [`rustakka_streams::Source<StreamEvent>`] wrapped in a
+/// [`rustakka_streams::KillSwitch`]:
+///
+/// - `overflow` is `Some((size, strategy))` to bound the per-subscriber
+///   buffer, or `None` for the default unbounded fan-out.
+/// - Dropping the returned `KillSwitch` or calling `shutdown()` closes
+///   the source and aborts the coordinator so in-flight supersteps
+///   finalize cleanly.
+/// - The third return value is the same `JoinHandle<GraphResult<_>>`
+///   that [`stream`] returns, so existing run-completion patterns
+///   transfer unchanged.
+pub fn stream_source(
+    graph: Arc<CompiledStateGraph>,
+    input: BTreeMap<String, Value>,
+    cfg: RunnableConfig,
+    modes: Vec<StreamMode>,
+    overflow: Option<(usize, rustakka_streams::OverflowStrategy)>,
+) -> (
+    rustakka_streams::Source<StreamEvent>,
+    rustakka_streams::KillSwitch,
+    tokio::task::JoinHandle<GraphResult<RunResult>>,
+) {
+    let bus = Arc::new(StreamBus::new());
+    let (subscription, source) = bus.subscribe_source(modes, overflow);
+    let kill_switch = rustakka_streams::KillSwitch::new();
+    let gated = kill_switch.flow(source);
+
+    let bus_for_run = bus.clone();
+    let ks_for_run = kill_switch.clone();
+    let h = tokio::spawn(async move {
+        // Hold the subscription for the lifetime of the run so the
+        // subscriber isn't unregistered prematurely; it's dropped only
+        // when the run completes or the kill-switch fires.
+        let _sub = subscription;
+        let res = run_one_with_bus_cancellable(
+            graph,
+            input,
+            cfg,
+            None,
+            None,
+            bus_for_run,
+            None,
+            Some(ks_for_run),
+        )
+        .await;
+        res
+    });
+    (gated, kill_switch, h)
+}
+
 async fn run_one(
     graph: Arc<CompiledStateGraph>,
     input: BTreeMap<String, Value>,
@@ -250,20 +302,34 @@ pub async fn run_internal_with_parent(
     parent: Option<(StreamBus, Vec<String>)>,
 ) -> GraphResult<RunResult> {
     let bus = Arc::new(StreamBus::new());
+    // Express forwarding as a rustakka-streams Source → Flow(map) → Sink
+    // pipeline: the child-bus receiver becomes a `Source<StreamEvent>`,
+    // the `map` step injects the ancestor namespace, and
+    // `Sink::for_each` writes into the parent bus. This replaces the
+    // hand-rolled `while let Some(..) = rx.recv()` loop and gives us a
+    // single cancellation point (the parent guard's drop, identical to
+    // the old `JoinHandle::abort`).
     let forward_handle = parent.map(|(parent_bus, namespace)| {
-        let mut rx = bus.subscribe(Vec::new());
-        tokio::spawn(async move {
-            while let Some(mut ev) = rx.recv().await {
-                let ns = ev.namespace_mut();
-                if ns.is_empty() {
-                    *ns = namespace.clone();
-                } else {
-                    let mut merged = namespace.clone();
-                    merged.extend(ns.iter().cloned());
-                    *ns = merged;
-                }
-                parent_bus.publish(ev);
+        let rx = bus.subscribe(Vec::new());
+        let source = rustakka_streams::Source::from_receiver(rx);
+        let ns = namespace.clone();
+        let mapped = source.map(move |mut ev| {
+            let ev_ns = ev.namespace_mut();
+            if ev_ns.is_empty() {
+                *ev_ns = ns.clone();
+            } else {
+                let mut merged = ns.clone();
+                merged.extend(ev_ns.iter().cloned());
+                *ev_ns = merged;
             }
+            ev
+        });
+        let parent_bus_c = parent_bus.clone();
+        tokio::spawn(async move {
+            rustakka_streams::Sink::for_each(mapped, move |ev| {
+                parent_bus_c.publish(ev);
+            })
+            .await;
         })
     });
     let res = run_one_with_bus(graph, input, cfg, checkpointer, resume, bus, None).await;
@@ -282,6 +348,24 @@ async fn run_one_with_bus(
     bus: Arc<StreamBus>,
     store: Option<Arc<dyn crate::context::StoreAccessor>>,
 ) -> GraphResult<RunResult> {
+    run_one_with_bus_cancellable(graph, input, cfg, checkpointer, resume, bus, store, None).await
+}
+
+/// Like [`run_one_with_bus`] but additionally observes a
+/// [`KillSwitch`]: when it fires the in-flight coordinator receives
+/// `CoordMsg::Stop` and the returned future resolves with the
+/// latched coordinator reply (or a "run cancelled" error if the
+/// coordinator never replied).
+async fn run_one_with_bus_cancellable(
+    graph: Arc<CompiledStateGraph>,
+    input: BTreeMap<String, Value>,
+    cfg: RunnableConfig,
+    checkpointer: Option<Arc<dyn CheckpointerHook>>,
+    resume: Option<Value>,
+    bus: Arc<StreamBus>,
+    store: Option<Arc<dyn crate::context::StoreAccessor>>,
+    kill: Option<rustakka_streams::KillSwitch>,
+) -> GraphResult<RunResult> {
     let sys = shared_system().await?;
     let topology = graph.topology().clone();
     let cache = Some(graph.node_cache().clone());
@@ -297,10 +381,40 @@ async fn run_one_with_bus(
     let coord = sys
         .actor_of(props, &name)
         .map_err(|e| GraphError::other(e.to_string()))?;
-    let (tx, rx) = oneshot::channel();
-    coord.tell(CoordMsg::StartRun { input, cfg, resume, reply: tx });
-    let res = rx.await.map_err(|_| GraphError::other("coordinator dropped"))?;
+    // `ask_with` is rustakka's idiomatic request/reply: the closure
+    // embeds the oneshot reply channel into the message, the call awaits
+    // the reply or an ask timeout, and we get uniform error handling
+    // (timeout vs target-dropped) for free. We pick a very long ask
+    // timeout so *recursion_limit* / user-level cancellation govern run
+    // duration instead of the ask pattern — the coordinator itself
+    // enforces the recursion limit and streams back an error on its own.
+    // Bridge an optional kill-switch → CoordMsg::Stop so dropping the
+    // user-facing Source cancels an in-flight run.
+    let watcher = kill.as_ref().map(|ks| {
+        let coord_ref = coord.clone();
+        let ks = ks.clone();
+        tokio::spawn(async move {
+            loop {
+                if ks.is_shut_down() {
+                    coord_ref.tell(CoordMsg::Stop);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+    });
+
+    let res = coord
+        .ask_with(
+            |reply| CoordMsg::StartRun { input, cfg, resume, reply },
+            Duration::from_secs(60 * 60 * 24),
+        )
+        .await
+        .map_err(|e| GraphError::other(format!("coordinator ask failed: {e}")))?;
     coord.tell(CoordMsg::Stop);
+    if let Some(h) = watcher {
+        h.abort();
+    }
     res
 }
 
@@ -479,6 +593,63 @@ mod tests {
         assert!(res.interrupted.is_some());
         // `a` wrote before the pause; `b` did not run.
         assert_eq!(res.values["ran"], json!("a"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_source_emits_events_and_completes() {
+        let mut g = StateGraph::<DynamicState>::new();
+        g.add_node("a", NodeKind::from_fn(|_| async move {
+            let mut m = BTreeMap::new();
+            m.insert("x".into(), json!(7));
+            Ok(NodeOutput::Update(m))
+        }))
+        .unwrap();
+        g.add_edge(START, "a");
+        g.add_edge("a", END);
+        let app = Arc::new(g.compile(CompileConfig::default()).await.unwrap());
+
+        let (source, _ks, h) = stream_source(
+            app,
+            BTreeMap::new(),
+            RunnableConfig::default(),
+            vec![StreamMode::Updates, StreamMode::Values],
+            None,
+        );
+
+        // Drive to completion, then collect what the source produced.
+        let run_res = h.await.unwrap().unwrap();
+        assert_eq!(run_res.values["x"], json!(7));
+
+        // After the run completes the bus is dropped → source ends.
+        let seen = rustakka_streams::Sink::collect(source).await;
+        assert!(seen.iter().any(|e| matches!(e, StreamEvent::Updates { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_switch_cancels_in_flight_run() {
+        let mut g = StateGraph::<DynamicState>::new();
+        // Never-terminating tight loop — relies on the kill switch to stop.
+        g.add_node("loop", NodeKind::from_fn(|_| async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(NodeOutput::Update(BTreeMap::new()))
+        }))
+        .unwrap();
+        g.add_edge(START, "loop");
+        g.add_edge("loop", "loop");
+        let app = Arc::new(g.compile(CompileConfig::default()).await.unwrap());
+
+        let (_source, ks, h) = stream_source(
+            app,
+            BTreeMap::new(),
+            RunnableConfig::default(),
+            vec![],
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        ks.shutdown();
+        // After shutdown the run should complete within a bounded window.
+        let res = tokio::time::timeout(Duration::from_secs(2), h).await;
+        assert!(res.is_ok(), "run didn't terminate after kill switch");
     }
 
     /// Returns a no-op hook so we can use `invoke_with_checkpointer`

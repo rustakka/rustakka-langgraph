@@ -18,6 +18,7 @@ mock    = []
 full    = ["openai", "ollama", "bedrock", "azure", "vertex", "mock"]
 
 [dependencies]
+rustakka-streams = { workspace = true }
 async-trait  = { workspace = true }
 async-stream = { workspace = true }
 serde        = { workspace = true }

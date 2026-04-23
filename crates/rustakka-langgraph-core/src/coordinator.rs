@@ -24,7 +24,8 @@ use crate::command::{Command, Interrupt, Send as GraphSend};
 use crate::config::{RunnableConfig, StreamMode};
 use crate::errors::{GraphError, GraphResult};
 use crate::graph::{GraphTopology, END, START};
-use crate::node::{NodeKind, NodeOutput};
+use crate::node::NodeOutput;
+use crate::node_worker::{NodeDispatchRouter, NodeInvoke, NodeWorker};
 use crate::state::GraphValues;
 use crate::stream::{StreamBus, StreamEvent};
 
@@ -427,6 +428,11 @@ impl GraphCoordinator {
 
         self.publish_debug(format!("plan step={} targets={:?}", self.state.step, targets));
 
+        // Build the invoke list (filtering END and unknown nodes). We
+        // stage the invokes first so we can spawn a correctly-sized
+        // worker pool and fan out through a `NodeDispatchRouter`
+        // (round-robin) instead of hand-rolled per-target spawning.
+        let mut invokes: Vec<NodeInvoke> = Vec::with_capacity(targets.len());
         for (i, tgt) in targets.into_iter().enumerate() {
             if tgt.node == END {
                 continue;
@@ -438,7 +444,7 @@ impl GraphCoordinator {
                 }
                 return;
             };
-            let node_kind = clone_node(node);
+            let node_kind = node.clone_kind();
             let task_id = format!("{}-{}-{}", tgt.node, self.state.step, i);
             self.state.pending.insert(task_id.clone());
 
@@ -449,7 +455,6 @@ impl GraphCoordinator {
             } else {
                 values_map.clone()
             };
-            let self_ref = ctx.self_ref().clone();
             let node_name = tgt.node.clone();
             let writer = crate::stream::StreamWriter::new(
                 (*self.stream_bus).clone(),
@@ -468,45 +473,46 @@ impl GraphCoordinator {
                 namespace: Vec::new(),
             });
             let store = self.store.clone();
-            tokio::spawn(async move {
-                // Cache read (if policy attached + entry fresh).
-                if let (Some(pol), Some(cache)) = (cache_policy.as_ref(), cache.as_ref()) {
-                    let key = (pol.key_func)(&input);
-                    let now = std::time::Instant::now();
-                    let hit = {
-                        let g = cache.read();
-                        g.get(&(node_name.clone(), key.clone())).and_then(|e| {
-                            match e.expires_at {
-                                Some(exp) if exp <= now => None,
-                                _ => Some(e.value.clone()),
-                            }
-                        })
-                    };
-                    if let Some(values) = hit {
-                        let result = Ok(NodeOutput::Update(values));
-                        self_ref.tell(CoordMsg::NodeDone { task_id, node: node_name, result });
+            invokes.push(NodeInvoke {
+                task_id,
+                node: node_name,
+                node_kind,
+                input,
+                writer,
+                retry,
+                cache_policy,
+                cache,
+                store,
+                coord: ctx.self_ref().clone(),
+            });
+        }
+
+        if !invokes.is_empty() {
+            // Pool size caps at NODE_POOL_MAX so we don't balloon the
+            // child count for huge fan-outs. Spreading N>pool_size
+            // invokes across a small pool is the whole point of
+            // `RoundRobinRouter`.
+            const NODE_POOL_MAX: usize = 8;
+            let pool_size = invokes.len().min(NODE_POOL_MAX).max(1);
+            let mut workers: Vec<rustakka_core::actor::ActorRef<NodeInvoke>> =
+                Vec::with_capacity(pool_size);
+            for idx in 0..pool_size {
+                let name = format!("nw-{}-{}", self.state.step, idx);
+                match ctx.spawn(NodeWorker::props(), &name) {
+                    Ok(w) => workers.push(w),
+                    Err(e) => {
+                        self.state.aborted = true;
+                        if let Some(reply) = self.state.reply.take() {
+                            let _ = reply.send(Err(GraphError::other(e.to_string())));
+                        }
                         return;
                     }
-                    let result =
-                        invoke_with_retry(node_kind, input.clone(), writer, retry, store).await;
-                    // Cache successful `Update` outputs only (not Command /
-                    // Send / Interrupt, which carry control-flow state).
-                    if let Ok(NodeOutput::Update(ref values)) = result {
-                        let expires_at = pol
-                            .ttl_seconds
-                            .map(|s| now + std::time::Duration::from_secs(s));
-                        cache.write().insert(
-                            (node_name.clone(), key),
-                            crate::graph::CacheEntry { value: values.clone(), expires_at },
-                        );
-                    }
-                    self_ref.tell(CoordMsg::NodeDone { task_id, node: node_name, result });
-                    return;
                 }
-                let result =
-                    invoke_with_retry(node_kind, input, writer, retry, store).await;
-                self_ref.tell(CoordMsg::NodeDone { task_id, node: node_name, result });
-            });
+            }
+            let router = NodeDispatchRouter::new(workers);
+            for invoke in invokes {
+                router.route(invoke);
+            }
         }
 
         if let Some(values) = &self.state.values {
@@ -760,64 +766,11 @@ impl GraphCoordinator {
     }
 }
 
-fn clone_node(n: &NodeKind) -> NodeKind {
-    match n {
-        NodeKind::Rust(f) => NodeKind::Rust(f.clone()),
-        NodeKind::Python(p) => NodeKind::Python(p.clone()),
-        NodeKind::Subgraph(s) => NodeKind::Subgraph(s.clone()),
-    }
-}
-
-/// Invoke a node honoring its optional [`RetryPolicy`]. The task-local
-/// `StreamWriter` and (optionally) `CURRENT_STORE` are installed once and
-/// re-used across retries so any streamed chunks / store operations from
-/// partial attempts remain correctly attributed.
-async fn invoke_with_retry(
-    node_kind: NodeKind,
-    input: BTreeMap<String, Value>,
-    writer: crate::stream::StreamWriter,
-    retry: Option<crate::graph::RetryPolicy>,
-    store: Option<Arc<dyn crate::context::StoreAccessor>>,
-) -> GraphResult<NodeOutput> {
-    let attempts = retry
-        .as_ref()
-        .map(|r| r.max_attempts.max(1))
-        .unwrap_or(1);
-    let backoff_ms = retry.as_ref().map(|r| r.backoff_ms).unwrap_or(0);
-    let mut last_err: Option<GraphError> = None;
-    for attempt in 0..attempts {
-        let input_i = input.clone();
-        let node = clone_node_kind(&node_kind);
-        let writer_i = writer.clone();
-        let store_i = store.clone();
-        let res = crate::stream::CURRENT_WRITER
-            .scope(writer_i, async move {
-                match store_i {
-                    Some(s) => {
-                        crate::context::CURRENT_STORE
-                            .scope(s, async move { node.invoke(input_i).await })
-                            .await
-                    }
-                    None => node.invoke(input_i).await,
-                }
-            })
-            .await;
-        match res {
-            Ok(out) => return Ok(out),
-            Err(e) => {
-                last_err = Some(e);
-                if attempt + 1 < attempts && backoff_ms > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                }
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| GraphError::other("retry policy exhausted with no error")))
-}
-
-fn clone_node_kind(n: &NodeKind) -> NodeKind {
-    clone_node(n)
-}
+// NOTE: The previous hand-rolled `invoke_with_retry` / `clone_node` helpers
+// used to live here. They were replaced by `NodeWorker` + `run_node` in
+// `crate::node_worker`, which drives retries through
+// `rustakka_core::pattern::BackoffOptions` and runs each node as a
+// supervised child actor.
 
 // suppress unused warnings on optional helpers
 const _: fn() = || {

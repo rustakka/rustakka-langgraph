@@ -97,9 +97,20 @@ impl GraphValues {
     }
 
     /// Lazily declare a channel; reducer defaults to `LastValue` if unknown.
+    ///
+    /// The previous implementation used `contains_key` + `insert`, which
+    /// races under concurrent fan-out (two dispatch targets touching the same
+    /// channel name can both observe `!contains_key` and then both `insert`,
+    /// leaking out-of-order entries into `order`). Using `DashMap::entry`
+    /// collapses the check-and-set into a single atomic guard and we only
+    /// push into `order` on the branch that actually created the entry.
     pub fn ensure_channel(&self, name: &str, kind: ChannelKind) {
-        if !self.inner.channels.contains_key(name) {
-            self.inner.channels.insert(name.into(), StoredChannel::new(kind));
+        let mut inserted = false;
+        self.inner.channels.entry(name.to_string()).or_insert_with(|| {
+            inserted = true;
+            StoredChannel::new(kind)
+        });
+        if inserted {
             self.inner.order.write().push(name.into());
         }
     }

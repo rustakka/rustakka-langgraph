@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 rustakka-core    = { workspace = true }
 rustakka-config  = { workspace = true }
+rustakka-streams = { workspace = true }
 tokio            = { workspace = true }
 async-trait      = { workspace = true }
 futures          = { workspace = true }

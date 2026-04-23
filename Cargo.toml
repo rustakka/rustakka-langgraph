@@ -31,6 +31,7 @@ rustakka              = { git = "https://github.com/cognect/rustakka", rev = "ed
 rustakka-core         = { git = "https://github.com/cognect/rustakka", rev = "eda028ca0598a9ba258f350227b78a660882b5e3" }
 rustakka-config       = { git = "https://github.com/cognect/rustakka", rev = "eda028ca0598a9ba258f350227b78a660882b5e3" }
 rustakka-persistence  = { git = "https://github.com/cognect/rustakka", rev = "eda028ca0598a9ba258f350227b78a660882b5e3" }
+rustakka-streams      = { git = "https://github.com/cognect/rustakka", rev = "eda028ca0598a9ba258f350227b78a660882b5e3" }
 
 # Async / runtime
 tokio        = { version = "1.39", features = ["full"] }
@@ -104,3 +105,4 @@ rustakka             = { path = "../rustakka/crates/rustakka" }
 rustakka-core        = { path = "../rustakka/crates/rustakka-core" }
 rustakka-config      = { path = "../rustakka/crates/rustakka-config" }
 rustakka-persistence = { path = "../rustakka/crates/rustakka-persistence" }
+rustakka-streams     = { path = "../rustakka/crates/rustakka-streams" }

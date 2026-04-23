@@ -65,6 +65,12 @@ pub enum NodeKind {
     Subgraph(Arc<dyn SubgraphInvoker>),
 }
 
+impl Clone for NodeKind {
+    fn clone(&self) -> Self {
+        self.clone_kind()
+    }
+}
+
 impl std::fmt::Debug for NodeKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -106,6 +112,18 @@ impl NodeKind {
             NodeKind::Rust(f) => f(input).await,
             NodeKind::Python(p) => p.call(input).await,
             NodeKind::Subgraph(s) => s.invoke(input).await,
+        }
+    }
+
+    /// Shallow-clone the underlying handle (Arc bump). `NodeKind` doesn't
+    /// derive `Clone` because the variants hold boxed trait objects; this
+    /// is the cheap structural copy used by the coordinator and node
+    /// workers when dispatching.
+    pub fn clone_kind(&self) -> Self {
+        match self {
+            NodeKind::Rust(f) => NodeKind::Rust(f.clone()),
+            NodeKind::Python(p) => NodeKind::Python(p.clone()),
+            NodeKind::Subgraph(s) => NodeKind::Subgraph(s.clone()),
         }
     }
 }

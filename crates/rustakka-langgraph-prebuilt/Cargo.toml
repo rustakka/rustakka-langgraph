@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 rustakka-langgraph-core = { workspace = true }
+rustakka-streams = { workspace = true }
 async-trait = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }

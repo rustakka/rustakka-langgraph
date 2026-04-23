@@ -29,10 +29,13 @@ flowchart LR
     Shim -->|forwards to| Py[rustakka_langgraph package]
     Py -->|PyO3 cdylib| Native[rustakka_langgraph._native]
     Native --> Coord[GraphCoordinator actor]
-    Coord -->|plan/dispatch| NodeTasks[tokio::spawn per node]
-    NodeTasks -->|NodeDone| Coord
-    Coord -->|StreamEvent::*| Bus[StreamBus]
-    Bus -->|mpsc| Native
+    Coord -->|RoundRobinRouter dispatch| Workers["NodeWorker actors (pool)"]
+    Workers -->|pipe_to NodeDone| Coord
+    Coord -->|publish| Bus[StreamBus]
+    Bus -->|Source#lt;StreamEvent#gt; + KillSwitch| Native
+    Subgraph[SubgraphAdapter] -->|Source::from_receiver .map namespace| Bus
+    Provider[ChatModel::stream_source] -->|Source| Bus
+    ToolNode[ToolNode] -->|Source::from_iter map_async_unordered| Coord
     Coord -->|put/get_tuple| Saver[Checkpointer]
     Saver --> DB[(Memory / SQLite / Postgres)]
     Coord -->|get/put| Store[BaseStore]
@@ -81,13 +84,18 @@ three phases that execute strictly in order inside `GraphCoordinator`:
    breakpoints declared via `CompileConfig.interrupt_before` also fire
    here — the coordinator pauses, persists a checkpoint, and surfaces
    the `Interrupt` to the caller before dispatching the named node.
-2. **Execute** — spawn a `tokio::task` per target. The coordinator owns
-   a `HashSet<task_id>` (`state.pending`). Each spawned task installs a
-   task-local `StreamWriter` (see *Streaming*) and, when a store is
-   attached, a `CURRENT_STORE`. Nodes with a `CachePolicy` check the
-   per-graph cache and short-circuit on a fresh hit; otherwise the node
-   executes through `invoke_with_retry` (honouring `RetryPolicy`) and
-   the coordinator receives `CoordMsg::NodeDone { task_id, node, result }`.
+2. **Execute** — materialize a pool of `NodeWorker` child actors (one
+   per unique node name, load-spread with a
+   `RoundRobinRouter<NodeInvoke>`) and dispatch a `NodeInvoke` message
+   per target. Workers install a task-local `StreamWriter` (see
+   *Streaming*) and, when a store is attached, a `CURRENT_STORE`. Nodes
+   with a `CachePolicy` short-circuit on a fresh hit; otherwise the
+   worker executes the node through a `rustakka` `BackoffOptions` retry
+   loop (honouring `RetryPolicy`) and replies to the coordinator with
+   `CoordMsg::NodeDone { task_id, node, result }`. Panics inside user
+   code are caught and translated to `GraphError` rather than tripping
+   supervision — the worker supervisor uses `Directive::Stop` to
+   prevent restart storms on permanently-failing tasks.
 3. **Update** — once `pending` drains, aggregate writes through the
    channel reducers, emit `Updates` / `Values` / `OnChainEnd` stream
    events, drain any `Command { graph: "PARENT", .. }` escalation into
@@ -164,11 +172,32 @@ unchanged — byte-for-byte compatible with upstream snapshots.
 
 ## Streaming
 
-The `StreamBus` is a lightweight broadcast fan-out (not a rustakka actor
-— it's on the hot path and we want minimal indirection). Every event
-carries a `namespace: Vec<String>` which is empty for the root graph and
-populated with the `[subgraph_node, …]` path when forwarded from a
-child.
+The `StreamBus` is a *message-shaped* broadcast fan-out: mutations of
+the subscriber list (subscribe / unsubscribe) are serialised through a
+single writer lock — the same linearization an actor mailbox would give
+— while `publish` takes a read lock and fans out inline. Subscribers
+can take either the legacy `mpsc::UnboundedReceiver<StreamEvent>`
+surface (`bus.subscribe(modes)`) or the streams-native one
+(`bus.subscribe_source(modes, overflow)`), which returns a
+`rustakka_streams::Source<StreamEvent>` with an optional
+`OverflowStrategy` (`Backpressure`, `DropHead`, `DropNew`,
+`DropTail`, `DropBuffer`, `Fail`). Dropping the returned
+`Subscription` unregisters the subscriber and terminates the source.
+
+`runner::stream_source` layers a `KillSwitch` on top of that source:
+triggering the switch aborts the coordinator (`CoordMsg::Stop`) and
+closes every subscriber's source. Subgraph events flow through the
+same streams abstraction — the subgraph adapter wraps its child bus
+receiver in `Source::from_receiver(...).map(namespace_inject)
+.runForeach(parent_bus.publish)` so slow parents naturally backpressure
+onto the child's bus. Provider token streams flow through
+`chat_model_stream_source(..)`, a `Source<Result<GenerationChunk,
+ProviderError>>` that is `wire_tap`ed to publish `OnChatModelStream`
+events through the active `StreamWriter::chat_model_chunk`.
+
+Every event carries a `namespace: Vec<String>` which is empty for the
+root graph and populated with the `[subgraph_node, …]` path when
+forwarded from a child.
 
 | Event | Mode | Emitted when |
 | --- | --- | --- |

@@ -1,7 +1,12 @@
 //! The [`ChatModel`] trait — the core abstraction every LLM provider implements.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use futures::StreamExt;
+use rustakka_streams::Source;
+use tokio::sync::mpsc;
 
 use crate::error::ProviderError;
 use crate::types::message::Message;
@@ -58,4 +63,36 @@ pub trait ChatModel: Send + Sync + std::fmt::Debug {
 
     /// Human-readable model identifier (e.g. `"gpt-4o"`, `"llama3:8b"`).
     fn model_name(&self) -> &str;
+}
+
+/// Additive rustakka-streams entry point. Wraps [`ChatModel::stream`] in
+/// a `Source<Result<GenerationChunk, ProviderError>>` that owns its own
+/// `Arc<dyn ChatModel>` — the caller can compose it with
+/// [`rustakka_streams`] operators (`map`, `runWith`, overflow, kill
+/// switch) without worrying about the original `&self` borrow.
+///
+/// A background task is spawned that drives the underlying `stream()`;
+/// it terminates automatically when the source is fully consumed or
+/// dropped.
+pub fn chat_model_stream_source(
+    model: Arc<dyn ChatModel>,
+    messages: Vec<Message>,
+    options: CallOptions,
+) -> Source<Result<GenerationChunk, ProviderError>> {
+    let (tx, rx) = mpsc::unbounded_channel::<Result<GenerationChunk, ProviderError>>();
+    tokio::spawn(async move {
+        match model.stream(&messages, &options).await {
+            Err(e) => {
+                let _ = tx.send(Err(e));
+            }
+            Ok(mut s) => {
+                while let Some(chunk) = s.next().await {
+                    if tx.send(chunk).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    Source::from_receiver(rx)
 }
